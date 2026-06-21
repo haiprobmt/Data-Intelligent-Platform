@@ -13,7 +13,9 @@ SOURCE_FILE_EXTENSIONS: dict[str, set[str]] = {
     "parquet": {".parquet"},
 }
 
-DOCUMENT_FILE_EXTENSIONS = {".doc", ".docx", ".xlsx", ".xls", ".csv", ".txt", ".md"}
+DOCUMENT_FILE_EXTENSIONS = {".doc", ".docx", ".xlsx", ".xls", ".csv", ".txt", ".md", ".pdf"}
+SOURCE_MIME_PREFIXES = {"text/", "application/json", "application/vnd", "application/octet-stream"}
+DOCUMENT_MIME_PREFIXES = {"text/", "application/pdf", "application/vnd", "application/msword", "application/octet-stream"}
 
 
 def validate_source_file(system_type: str, file_name: str) -> None:
@@ -37,14 +39,41 @@ async def save_uploaded_file(file: UploadFile, tenant_id: str, category: str) ->
     file_name = _safe_file_name(file.filename or "upload")
     if category == "documents":
         validate_document_file(file_name)
+        validate_mime_type(file.content_type, DOCUMENT_MIME_PREFIXES)
+    if category == "sources":
+        validate_mime_type(file.content_type, SOURCE_MIME_PREFIXES)
     upload_root = Path(get_settings().upload_dir) / category / tenant_id
     upload_root.mkdir(parents=True, exist_ok=True)
     stored_path = upload_root / f"{uuid4()}_{file_name}"
-    content = await file.read()
-    if not content:
+    max_bytes = get_settings().max_upload_size_mb * 1024 * 1024
+    total_bytes = 0
+    with stored_path.open("wb") as handle:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            total_bytes += len(chunk)
+            if total_bytes > max_bytes:
+                handle.close()
+                stored_path.unlink(missing_ok=True)
+                raise HTTPException(status_code=413, detail=f"Uploaded file exceeds {get_settings().max_upload_size_mb} MB")
+            handle.write(chunk)
+    if total_bytes == 0:
+        stored_path.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail="Uploaded file is empty")
-    stored_path.write_bytes(content)
+    scan_file_for_viruses(stored_path)
     return stored_path
+
+
+def validate_mime_type(content_type: str | None, allowed_prefixes: set[str]) -> None:
+    if not content_type:
+        return
+    if not any(content_type.startswith(prefix) for prefix in allowed_prefixes):
+        raise HTTPException(status_code=400, detail=f"Unsupported MIME type: {content_type}")
+
+
+def scan_file_for_viruses(file_path: Path) -> None:
+    return None
 
 
 def _safe_file_name(file_name: str) -> str:

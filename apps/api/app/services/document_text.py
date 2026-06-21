@@ -3,6 +3,8 @@ import zipfile
 from pathlib import Path
 from xml.etree import ElementTree
 
+from app.services.ocr import get_ocr_provider
+
 
 def extract_text_from_file(file_path: str | None) -> tuple[str, dict]:
     if not file_path:
@@ -72,4 +74,8 @@ def _extract_pdf(path: Path) -> tuple[str, dict]:
         pages.append({"page": index, "characters": len(page_text)})
         if page_text:
             text_parts.append(f"Page {index}\n{page_text}")
-    return "\n\n".join(text_parts), {"method": "pypdf", "pages": pages}
+    text = "\n\n".join(text_parts)
+    if text.strip():
+        return text, {"method": "pypdf", "pages": pages}
+    ocr_result = get_ocr_provider().extract(str(path))
+    return ocr_result.text, {"method": "ocr", "provider": ocr_result.provider, "pages": ocr_result.pages, "confidence": ocr_result.confidence}

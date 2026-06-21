@@ -6,6 +6,17 @@ SQLITE_COLUMNS: dict[str, dict[str, str]] = {
         "owner": "VARCHAR(180)",
         "steward": "VARCHAR(180)",
         "source_freshness_at": "DATETIME",
+        "row_count_is_estimated": "BOOLEAN DEFAULT 1",
+    },
+    "source_systems": {
+        "secret_id": "VARCHAR(36)",
+        "scan_mode": "VARCHAR(40) DEFAULT 'metadata_only'",
+    },
+    "metadata_relationships": {
+        "from_table_id": "VARCHAR(36)",
+        "from_schema": "VARCHAR(120)",
+        "to_table_id": "VARCHAR(36)",
+        "to_schema": "VARCHAR(120)",
     },
     "documents": {
         "file_path": "VARCHAR(500)",

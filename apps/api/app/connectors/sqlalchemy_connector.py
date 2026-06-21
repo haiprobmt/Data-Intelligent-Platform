@@ -24,7 +24,7 @@ class SqlAlchemyConnector(BaseConnector):
             return ["main"]
         return [schema for schema in inspector.get_schema_names() if schema not in {"information_schema", "pg_catalog"}]
 
-    def list_tables(self) -> list[TableMetadata]:
+    def list_tables(self, scan_mode: str = "metadata_only") -> list[TableMetadata]:
         inspector = inspect(self.engine)
         database_name = self.engine.url.database or self.source_name
         tables: list[TableMetadata] = []
@@ -43,7 +43,8 @@ class SqlAlchemyConnector(BaseConnector):
                         database_name=database_name,
                         schema_name=schema,
                         table_name=table_name,
-                        row_count=self._row_count(table_name, table_schema),
+                        row_count=self._row_count(table_name, table_schema, scan_mode),
+                        row_count_is_estimated=scan_mode == "metadata_only" and self.engine.dialect.name != "sqlite",
                         columns=[
                             ColumnMetadata(
                                 column_name=column["name"],
@@ -92,6 +93,8 @@ class SqlAlchemyConnector(BaseConnector):
                             from_columns=list(foreign_key.get("constrained_columns") or []),
                             to_table=str(referred_table),
                             to_columns=list(foreign_key.get("referred_columns") or []),
+                            from_schema=schema,
+                            to_schema=str(foreign_key.get("referred_schema") or schema),
                         )
                     )
         return relationships
@@ -120,6 +123,7 @@ class SqlAlchemyConnector(BaseConnector):
         sample = select(table).limit(config.row_limit).subquery()
         profiles: dict[str, dict[str, Any]] = {}
         with self.engine.connect().execution_options(timeout=config.timeout_seconds) as connection:
+            self._apply_statement_timeout(connection, config.timeout_seconds)
             sampled_count = int(connection.execute(select(func.count()).select_from(sample)).scalar_one() or 0)
             for column_name in selected_columns:
                 column = sample.c[column_name]
@@ -132,10 +136,52 @@ class SqlAlchemyConnector(BaseConnector):
                 }
         return profiles
 
-    def _row_count(self, table_name: str, schema_name: str | None) -> int:
+    def _apply_statement_timeout(self, connection, timeout_seconds: int) -> None:
+        timeout_ms = max(1, timeout_seconds) * 1000
+        dialect = self.engine.dialect.name
+        if dialect == "postgresql":
+            connection.exec_driver_sql("SET statement_timeout = %s", (timeout_ms,))
+        elif dialect == "mysql":
+            connection.exec_driver_sql("SET SESSION MAX_EXECUTION_TIME=%s", (timeout_ms,))
+
+    def _row_count(self, table_name: str, schema_name: str | None, scan_mode: str) -> int:
+        if scan_mode == "metadata_only" and self.engine.dialect.name != "sqlite":
+            approximate = self._approximate_row_count(table_name, schema_name)
+            if approximate is not None:
+                return approximate
+            return 0
         table = Table(table_name, MetaData(), schema=schema_name, autoload_with=self.engine)
         with self.engine.connect() as connection:
             return int(connection.execute(select(func.count()).select_from(table)).scalar_one() or 0)
+
+    def _approximate_row_count(self, table_name: str, schema_name: str | None) -> int | None:
+        dialect = self.engine.dialect.name
+        with self.engine.connect() as connection:
+            if dialect == "postgresql":
+                qualified = f"{schema_name}.{table_name}" if schema_name else table_name
+                return int(connection.exec_driver_sql("select coalesce(reltuples, 0)::bigint from pg_class where oid = %s::regclass", (qualified,)).scalar() or 0)
+            if dialect == "mysql":
+                return int(
+                    connection.exec_driver_sql(
+                        "select coalesce(table_rows, 0) from information_schema.tables where table_schema = database() and table_name = %s",
+                        (table_name,),
+                    ).scalar()
+                    or 0
+                )
+            if dialect in {"mssql", "sqlserver"}:
+                return int(
+                    connection.exec_driver_sql(
+                        "select coalesce(sum(row_count), 0) from sys.dm_db_partition_stats where object_id = object_id(?) and index_id in (0,1)",
+                        (table_name,),
+                    ).scalar()
+                    or 0
+                )
+            if dialect == "oracle":
+                return int(
+                    connection.exec_driver_sql("select coalesce(num_rows, 0) from all_tables where table_name = :name", {"name": table_name.upper()}).scalar()
+                    or 0
+                )
+        return None
 
 
 def resolve_connection_url(secret_reference: str | None) -> str:

@@ -1,10 +1,8 @@
 import base64
 import hashlib
 import hmac
-import json
 import secrets
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
 from fastapi import Depends, Header, HTTPException, status
@@ -15,6 +13,8 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.database import get_db
 from app.models import TenantMembership, User
+from app.services.auth_tokens import create_access_token as encode_access_token
+from app.services.auth_tokens import decode_access_token as decode_token
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login", auto_error=False)
 
@@ -50,35 +50,24 @@ def verify_password(password: str, password_hash: str) -> bool:
 
 def create_access_token(user: User, tenant_id: str, role: str) -> str:
     settings = get_settings()
-    expires_at = datetime.now(timezone.utc) + timedelta(minutes=settings.auth_token_ttl_minutes)
-    payload = {
-        "sub": user.id,
-        "email": user.email,
-        "tenant_id": tenant_id,
-        "role": role,
-        "exp": int(expires_at.timestamp()),
-    }
-    header = {"alg": "HS256", "typ": "JWT"}
-    signing_input = f"{_b64_json(header)}.{_b64_json(payload)}"
-    signature = hmac.new(settings.auth_jwt_secret.encode("utf-8"), signing_input.encode("ascii"), hashlib.sha256).digest()
-    return f"{signing_input}.{_b64_bytes(signature)}"
+    return encode_access_token(
+        {
+            "sub": user.id,
+            "email": user.email,
+            "tenant_id": tenant_id,
+            "role": role,
+        },
+        settings.auth_jwt_secret,
+        settings.auth_token_ttl_minutes,
+    )
 
 
 def decode_access_token(token: str) -> dict:
     settings = get_settings()
     try:
-        header_part, payload_part, signature_part = token.split(".")
+        return decode_token(token, settings.auth_jwt_secret)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid access token") from exc
-    signing_input = f"{header_part}.{payload_part}"
-    expected = hmac.new(settings.auth_jwt_secret.encode("utf-8"), signing_input.encode("ascii"), hashlib.sha256).digest()
-    actual = _b64_decode(signature_part)
-    if not hmac.compare_digest(actual, expected):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid access token")
-    payload = json.loads(_b64_decode(payload_part))
-    if int(payload.get("exp", 0)) < int(datetime.now(timezone.utc).timestamp()):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Access token expired")
-    return payload
 
 
 def get_auth_context(
@@ -119,16 +108,3 @@ def get_tenant_id(x_tenant_id: str | None = Header(default=None, alias="X-Tenant
     if bootstrap_enabled:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Login required")
     return get_settings().default_tenant_id
-
-
-def _b64_json(value: dict) -> str:
-    return _b64_bytes(json.dumps(value, separators=(",", ":")).encode("utf-8"))
-
-
-def _b64_bytes(value: bytes) -> str:
-    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
-
-
-def _b64_decode(value: str) -> bytes:
-    padding = "=" * (-len(value) % 4)
-    return base64.urlsafe_b64decode((value + padding).encode("ascii"))

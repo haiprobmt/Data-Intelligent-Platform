@@ -59,11 +59,12 @@ def run_job(job_id: str, tenant_id: str, task: Callable[[Session, str, str], dic
     except Exception as exc:
         job = db.get(Job, job_id)
         if job is not None:
-            job.status = "failed"
+            cancelled = str(exc) == "Job cancellation requested"
+            job.status = "cancelled" if cancelled else "failed"
             job.message = str(exc)
             job.updated_at = datetime.utcnow()
-            log_job(db, tenant_id, job.id, "error", str(exc))
-            audit(db, tenant_id, f"{job.job_type}.failed", {"job_id": job_id, "error": str(exc)})
+            log_job(db, tenant_id, job.id, "warning" if cancelled else "error", str(exc))
+            audit(db, tenant_id, f"{job.job_type}.{'cancelled' if cancelled else 'failed'}", {"job_id": job_id, "error": str(exc)})
             db.commit()
     finally:
         db.close()

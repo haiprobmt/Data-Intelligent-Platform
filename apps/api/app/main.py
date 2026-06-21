@@ -1,19 +1,30 @@
 import json
+import zipfile
+from io import BytesIO
 
-from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
-from app.config import get_settings
+from app.config import get_settings, validate_security_settings
 from app.database import Base, SessionLocal, engine, get_db
-from app.models import DataQualityIssue, Document, Job, JobLog, MetadataTable, PocAsset, Recommendation, SourceSystem, Tenant, TenantMembership, User
+from app.models import AssessmentProfile, AssessmentProject, ConnectionSecret, DataQualityIssue, Document, DocumentExtractedField, Job, JobLog, MetadataColumn, MetadataTable, PocAsset, Recommendation, SourceSystem, Tenant, TenantMembership, User
 from app.schemas import (
+    AssessmentProfileIn,
+    AssessmentProfileOut,
+    AssessmentProjectCreate,
+    AssessmentProjectOut,
     DashboardSnapshot,
+    ConnectionSecretCreate,
+    ConnectionSecretOut,
     CopilotAnswer,
     CopilotQuestion,
     CurrentUserOut,
+    DocumentExtractedFieldOut,
     DocumentOut,
+    DocumentReviewPatch,
     DocumentUpload,
     IssueOut,
     JobLogOut,
@@ -38,7 +49,7 @@ from app.services.profiler import quality_scores, run_profile
 from app.services.recommendations import architecture_mermaid, generate_poc_assets, generate_recommendations
 from app.services.scanner import run_metadata_scan
 from app.services.schema_compat import ensure_schema_compat
-from app.services.secrets import validate_secret_reference_for_tenant
+from app.services.secrets import provider_for_reference, resolve_secret_reference, validate_secret_reference_for_tenant
 from app.services.uploads import save_uploaded_file, validate_source_file
 
 settings = get_settings()
@@ -54,8 +65,10 @@ app.add_middleware(
 
 @app.on_event("startup")
 def startup() -> None:
-    Base.metadata.create_all(bind=engine)
-    ensure_schema_compat(engine)
+    validate_security_settings(settings)
+    if settings.environment.lower() in {"local", "dev", "development"}:
+        Base.metadata.create_all(bind=engine)
+        ensure_schema_compat(engine)
     with SessionLocal() as db:
         bootstrap_admin_user(db)
 
@@ -97,6 +110,65 @@ def dashboard(context: AuthContext = Depends(get_auth_context), db: Session = De
     return dashboard_snapshot(db, context.tenant_id)
 
 
+@app.post("/api/connection-secrets", response_model=ConnectionSecretOut)
+def create_connection_secret(payload: ConnectionSecretCreate, context: AuthContext = Depends(require_role("admin")), db: Session = Depends(get_db)) -> ConnectionSecret:
+    try:
+        validate_secret_reference_for_tenant(payload.reference, context.tenant_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    actual_provider = provider_for_reference(payload.reference)
+    if payload.provider != actual_provider:
+        raise HTTPException(status_code=400, detail=f"Reference uses {actual_provider}, not {payload.provider}")
+    secret = ConnectionSecret(tenant_id=context.tenant_id, name=payload.name, provider=payload.provider, reference=payload.reference)
+    db.add(secret)
+    audit(db, context.tenant_id, "connection_secret.create", {"name": payload.name, "provider": payload.provider})
+    db.commit()
+    db.refresh(secret)
+    return secret
+
+
+@app.get("/api/connection-secrets", response_model=list[ConnectionSecretOut])
+def list_connection_secrets(context: AuthContext = Depends(get_auth_context), db: Session = Depends(get_db)) -> list[ConnectionSecret]:
+    return db.scalars(select(ConnectionSecret).where(ConnectionSecret.tenant_id == context.tenant_id).order_by(ConnectionSecret.created_at.desc())).all()
+
+
+@app.post("/api/connection-secrets/{secret_id}/test")
+def test_connection_secret(secret_id: str, context: AuthContext = Depends(require_role("admin")), db: Session = Depends(get_db)) -> dict[str, str]:
+    secret = db.get(ConnectionSecret, secret_id)
+    if secret is None or secret.tenant_id != context.tenant_id:
+        raise HTTPException(status_code=404, detail="Connection secret not found")
+    try:
+        resolve_secret_reference(secret.reference)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"status": "resolved"}
+
+
+@app.post("/api/assessment/projects", response_model=AssessmentProjectOut)
+def create_assessment_project(payload: AssessmentProjectCreate, context: AuthContext = Depends(require_role("analyst")), db: Session = Depends(get_db)) -> AssessmentProject:
+    project = AssessmentProject(tenant_id=context.tenant_id, name=payload.name, industry=payload.industry, primary_goal=payload.primary_goal)
+    db.add(project)
+    audit(db, context.tenant_id, "assessment_project.create", {"name": payload.name})
+    db.commit()
+    db.refresh(project)
+    return project
+
+
+@app.get("/api/assessment/projects", response_model=list[AssessmentProjectOut])
+def list_assessment_projects(context: AuthContext = Depends(get_auth_context), db: Session = Depends(get_db)) -> list[AssessmentProject]:
+    return db.scalars(select(AssessmentProject).where(AssessmentProject.tenant_id == context.tenant_id).order_by(AssessmentProject.created_at.desc())).all()
+
+
+@app.post("/api/assessment/profile", response_model=AssessmentProfileOut)
+def save_assessment_profile(payload: AssessmentProfileIn, context: AuthContext = Depends(require_role("analyst")), db: Session = Depends(get_db)) -> AssessmentProfileOut:
+    score = score_assessment_profile(payload)
+    profile = AssessmentProfile(tenant_id=context.tenant_id, project_id=payload.project_id, answers=payload.model_dump(), **score.model_dump())
+    db.add(profile)
+    audit(db, context.tenant_id, "assessment_profile.score", score.model_dump())
+    db.commit()
+    return score
+
+
 def dashboard_snapshot(db: Session, tenant_id: str) -> DashboardSnapshot:
     ensure_tenant(db, tenant_id)
     source_count = db.scalar(select(func.count(SourceSystem.id)).where(SourceSystem.tenant_id == tenant_id)) or 0
@@ -131,13 +203,24 @@ def dashboard_snapshot(db: Session, tenant_id: str) -> DashboardSnapshot:
 def create_source_system(payload: SourceSystemCreate, context: AuthContext = Depends(require_role("analyst")), db: Session = Depends(get_db)) -> SourceSystem:
     tenant_id = context.tenant_id
     ensure_tenant(db, tenant_id)
+    if payload.secret_id:
+        secret = db.get(ConnectionSecret, payload.secret_id)
+        if secret is None or secret.tenant_id != tenant_id:
+            raise HTTPException(status_code=404, detail="Connection secret not found")
     if payload.secret_reference and not payload.secret_reference.startswith(("kv://", "vault://", "secret://", "env://", "sqlite://")):
         raise HTTPException(status_code=400, detail="Provide a secret reference, not raw credentials")
     try:
         validate_secret_reference_for_tenant(payload.secret_reference, tenant_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    source = SourceSystem(tenant_id=tenant_id, **payload.model_dump())
+    source_payload = payload.model_dump()
+    legacy_reference = source_payload.pop("secret_reference", None)
+    if legacy_reference and not payload.secret_id:
+        secret = ConnectionSecret(tenant_id=tenant_id, name=f"{payload.name} credential", provider=provider_for_reference(legacy_reference), reference=legacy_reference)
+        db.add(secret)
+        db.flush()
+        source_payload["secret_id"] = secret.id
+    source = SourceSystem(tenant_id=tenant_id, secret_reference=None, **source_payload)
     db.add(source)
     audit(db, tenant_id, "source.create", {"name": source.name, "system_type": source.system_type})
     db.commit()
@@ -200,7 +283,7 @@ def delete_source_system(source_system_id: str, context: AuthContext = Depends(r
 
 
 @app.post("/api/source-systems/{source_system_id}/scan", response_model=JobOut)
-def scan_source_system(source_system_id: str, background_tasks: BackgroundTasks, context: AuthContext = Depends(require_role("analyst")), db: Session = Depends(get_db)) -> Job:
+def scan_source_system(source_system_id: str, background_tasks: BackgroundTasks, scan_mode: str = Query(default="metadata_only", pattern="^(metadata_only|light_profile|full_profile)$"), context: AuthContext = Depends(require_role("analyst")), db: Session = Depends(get_db)) -> Job:
     tenant_id = context.tenant_id
     return enqueue_job(
         background_tasks,
@@ -208,7 +291,7 @@ def scan_source_system(source_system_id: str, background_tasks: BackgroundTasks,
         tenant_id,
         "metadata_scan",
         "Metadata scan queued",
-        lambda task_db, task_tenant_id, _job_id: run_metadata_scan(task_db, task_tenant_id, source_system_id),
+        lambda task_db, task_tenant_id, job_id: run_metadata_scan(task_db, task_tenant_id, source_system_id, job_id, scan_mode),
     )
 
 
@@ -235,7 +318,7 @@ def profile_source_system(source_system_id: str, background_tasks: BackgroundTas
         tenant_id,
         "data_profile",
         "Data profiling queued",
-        lambda task_db, task_tenant_id, _job_id: run_profile(task_db, task_tenant_id, source_system_id),
+        lambda task_db, task_tenant_id, job_id: run_profile(task_db, task_tenant_id, source_system_id, job_id),
     )
 
 
@@ -291,6 +374,40 @@ def document_result(document_id: str, context: AuthContext = Depends(get_auth_co
     return document
 
 
+@app.get("/api/documents/{document_id}/extracted-fields", response_model=list[DocumentExtractedFieldOut])
+def document_fields(document_id: str, context: AuthContext = Depends(get_auth_context), db: Session = Depends(get_db)) -> list[DocumentExtractedField]:
+    document = db.get(Document, document_id)
+    if document is None or document.tenant_id != context.tenant_id:
+        raise HTTPException(status_code=404, detail="Document not found")
+    return db.scalars(select(DocumentExtractedField).where(DocumentExtractedField.tenant_id == context.tenant_id, DocumentExtractedField.document_id == document_id).order_by(DocumentExtractedField.created_at.asc())).all()
+
+
+@app.patch("/api/documents/{document_id}/extraction-result", response_model=DocumentOut)
+def update_document_result(document_id: str, payload: DocumentReviewPatch, context: AuthContext = Depends(require_role("analyst")), db: Session = Depends(get_db)) -> Document:
+    document = db.get(Document, document_id)
+    if document is None or document.tenant_id != context.tenant_id:
+        raise HTTPException(status_code=404, detail="Document not found")
+    extracted = dict(document.extracted_fields or {})
+    fields_by_name = {
+        field.field_name: field
+        for field in db.scalars(select(DocumentExtractedField).where(DocumentExtractedField.tenant_id == context.tenant_id, DocumentExtractedField.document_id == document_id)).all()
+    }
+    for field_name, value in payload.fields.items():
+        extracted[field_name] = value
+        field = fields_by_name.get(field_name)
+        if field is None:
+            field = DocumentExtractedField(tenant_id=context.tenant_id, document_id=document_id, field_name=field_name)
+            db.add(field)
+        field.reviewed_value = str(value)
+        field.review_status = "corrected"
+    document.extracted_fields = extracted
+    document.status = "needs_review"
+    audit(db, context.tenant_id, "document.correct", {"document_id": document_id, "fields": sorted(payload.fields)})
+    db.commit()
+    db.refresh(document)
+    return document
+
+
 @app.post("/api/documents/{document_id}/approve", response_model=DocumentOut)
 def document_approve(document_id: str, context: AuthContext = Depends(require_role("analyst")), db: Session = Depends(get_db)) -> Document:
     try:
@@ -329,8 +446,8 @@ def analyze(background_tasks: BackgroundTasks, context: AuthContext = Depends(re
     def task(task_db: Session, task_tenant_id: str, _job_id: str) -> dict:
         sources = task_db.scalars(select(SourceSystem).where(SourceSystem.tenant_id == task_tenant_id)).all()
         for source in sources:
-            run_metadata_scan(task_db, task_tenant_id, source.id)
-            run_profile(task_db, task_tenant_id, source.id)
+            run_metadata_scan(task_db, task_tenant_id, source.id, _job_id, source.scan_mode)
+            run_profile(task_db, task_tenant_id, source.id, _job_id)
         generate_recommendations(task_db, task_tenant_id)
         generate_poc_assets(task_db, task_tenant_id)
         return {"sources_analyzed": len(sources)}
@@ -359,7 +476,7 @@ Answer the user's question using only this assessment snapshot. Be concise and p
 Question: {payload.question}
 Snapshot JSON: {json.dumps(snapshot, ensure_ascii=False)}
 """.strip()
-    answer = invoke_bedrock_text(prompt, max_tokens=700)
+    answer = invoke_bedrock_text(prompt, max_tokens=700, db=db, tenant_id=tenant_id, purpose="copilot")
     if not answer:
         raise HTTPException(status_code=503, detail="AWS Bedrock is not configured or did not return an answer")
     audit(db, tenant_id, "agent.copilot", {"question": payload.question})
@@ -399,8 +516,20 @@ def get_report(report_id: str, context: AuthContext = Depends(get_auth_context),
 
 
 @app.get("/api/reports/{report_id}/download")
-def download_report(report_id: str, context: AuthContext = Depends(get_auth_context), db: Session = Depends(get_db)) -> dict:
-    return {"report_id": report_id, "format": "json", "content": dashboard_snapshot(db, context.tenant_id).model_dump(mode="json")}
+def download_report(report_id: str, format: str = Query(default="json", pattern="^(json|md|zip)$"), context: AuthContext = Depends(get_auth_context), db: Session = Depends(get_db)):
+    snapshot = dashboard_snapshot(db, context.tenant_id).model_dump(mode="json")
+    if format == "json":
+        return {"report_id": report_id, "format": "json", "content": snapshot}
+    if format == "md":
+        markdown = report_markdown(report_id, snapshot)
+        return Response(content=markdown, media_type="text/markdown", headers={"Content-Disposition": f"attachment; filename={report_id}.md"})
+    archive = BytesIO()
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as package:
+        package.writestr(f"{report_id}.json", json.dumps(snapshot, indent=2))
+        package.writestr(f"{report_id}.md", report_markdown(report_id, snapshot))
+        for asset in snapshot.get("poc_assets", []):
+            package.writestr(asset["file_path"], asset.get("content") or "")
+    return Response(content=archive.getvalue(), media_type="application/zip", headers={"Content-Disposition": f"attachment; filename={report_id}.zip"})
 
 
 @app.get("/api/issues", response_model=list[IssueOut])
@@ -428,13 +557,86 @@ def get_job_or_404(db: Session, tenant_id: str, job_id: str) -> Job:
 def build_pain_points(db: Session, tenant_id: str) -> list[dict]:
     issues = db.scalars(select(DataQualityIssue).where(DataQualityIssue.tenant_id == tenant_id)).all()
     return [
-        {
-            "pain_point": issue.description,
-            "severity": issue.severity,
-            "affected_systems": ["Contoso ERP"],
-            "affected_entities": ["Customer", "Invoice", "Funding"],
-            "business_impact": "Dashboard and POC outputs may be delayed or trusted less by stakeholders.",
-            "recommended_action": issue.recommendation,
-        }
+        pain_point_from_issue(db, tenant_id, issue)
         for issue in issues[:6]
     ]
+
+
+def pain_point_from_issue(db: Session, tenant_id: str, issue: DataQualityIssue) -> dict:
+    table = db.get(MetadataTable, issue.table_id) if issue.table_id else None
+    source = db.get(SourceSystem, table.source_system_id) if table else None
+    column = db.get(MetadataColumn, issue.column_id) if issue.column_id else None
+    entity = table.detected_entity if table and table.detected_entity else "Operational data"
+    table_name = table.table_name if table else "Unknown table"
+    column_text = f" column {column.column_name}" if column else ""
+    return {
+        "pain_point": issue.description,
+        "severity": issue.severity,
+        "affected_systems": [source.name] if source and source.tenant_id == tenant_id else [],
+        "affected_entities": [entity] if entity else [],
+        "affected_tables": [table_name] if table else [],
+        "affected_columns": [column.column_name] if column else [],
+        "business_impact": f"{entity} quality or lineage may affect reporting, AI readiness, and downstream POC trust for {table_name}{column_text}.",
+        "recommended_action": issue.recommendation,
+    }
+
+
+def score_assessment_profile(payload: AssessmentProfileIn) -> AssessmentProfileOut:
+    fabric = 45
+    databricks = 45
+    reasoning: list[str] = []
+    if payload.current_microsoft_365_usage:
+        fabric += 10
+        reasoning.append("Existing Microsoft 365 usage supports Fabric adoption")
+    if payload.current_power_bi_usage:
+        fabric += 15
+        reasoning.append("Existing Power BI adoption favors Fabric semantic models")
+    if payload.current_databricks_usage:
+        databricks += 15
+        reasoning.append("Existing Databricks usage favors Databricks acceleration")
+    if payload.data_volume == "large":
+        databricks += 12
+        reasoning.append("Large data volume increases Databricks fit")
+    elif payload.data_volume == "small":
+        fabric += 8
+        reasoning.append("Smaller data volume favors Fabric time-to-value")
+    else:
+        fabric += 5
+    if payload.streaming_requirement:
+        databricks += 12
+        reasoning.append("Streaming requirement favors Databricks workflows")
+    if payload.ml_ai_requirement:
+        databricks += 6
+        fabric += 4
+        reasoning.append("AI requirement benefits from governed lakehouse patterns")
+    if payload.budget_sensitivity == "high":
+        fabric += 8
+        reasoning.append("Budget sensitivity favors bundled Microsoft analytics")
+    if payload.engineering_maturity == "high":
+        databricks += 8
+    elif payload.engineering_maturity == "low":
+        fabric += 8
+    if payload.governance_maturity == "high":
+        fabric += 5
+        databricks += 5
+    if payload.deployment_preference == "microsoft":
+        fabric += 15
+    elif payload.deployment_preference == "databricks":
+        databricks += 15
+    fabric = min(fabric, 100)
+    databricks = min(databricks, 100)
+    recommended = "Databricks" if databricks > fabric else "Microsoft Fabric"
+    return AssessmentProfileOut(fabric_score=fabric, databricks_score=databricks, recommended_platform=recommended, reasoning=reasoning or ["Balanced platform fit based on current answers"])
+
+
+def report_markdown(report_id: str, snapshot: dict) -> str:
+    lines = [f"# Assessment Report {report_id}", "", "## Metrics"]
+    for key, value in snapshot.get("metrics", {}).items():
+        lines.append(f"- {key}: {value}")
+    lines.extend(["", "## Recommendations"])
+    for recommendation in snapshot.get("recommendations", []):
+        lines.append(f"- **{recommendation['title']}** ({recommendation['priority']}): {recommendation['description']}")
+    lines.extend(["", "## Pain Points"])
+    for pain_point in snapshot.get("pain_points", []):
+        lines.append(f"- **{pain_point.get('severity')}**: {pain_point.get('pain_point')}")
+    return "\n".join(lines) + "\n"

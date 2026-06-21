@@ -6,9 +6,11 @@ from app.models import DataQualityIssue, MetadataColumn, MetadataIndex, Metadata
 from app.services.audit import audit
 from app.services.entity_discovery import detect_entity
 from app.services.graph import sync_neo4j_graph
+from app.services.jobs import update_job_progress
+from app.services.secrets import source_secret_reference
 
 
-def run_metadata_scan(db: Session, tenant_id: str, source_system_id: str) -> dict:
+def run_metadata_scan(db: Session, tenant_id: str, source_system_id: str, job_id: str | None = None, scan_mode: str | None = None) -> dict:
     source = db.scalar(
         select(SourceSystem).where(SourceSystem.id == source_system_id, SourceSystem.tenant_id == tenant_id)
     )
@@ -30,14 +32,21 @@ def run_metadata_scan(db: Session, tenant_id: str, source_system_id: str) -> dic
     db.execute(delete(MetadataView).where(MetadataView.tenant_id == tenant_id, MetadataView.source_system_id == source_system_id))
     db.execute(delete(MetadataProcedure).where(MetadataProcedure.tenant_id == tenant_id, MetadataProcedure.source_system_id == source_system_id))
 
-    connector = connector_for_source(source)
+    effective_scan_mode = scan_mode or source.scan_mode or "metadata_only"
+    secret_reference = source_secret_reference(db, tenant_id, source)
+    connector = connector_for_source(source, secret_reference)
     if not connector.test_connection():
         raise ValueError("Unable to connect using provided secret reference")
 
     table_count = 0
     column_count = 0
     table_ids_by_name: dict[str, str] = {}
-    for discovered in connector.list_tables():
+    table_ids_by_schema_name: dict[tuple[str | None, str], str] = {}
+    discovered_tables = connector.list_tables(effective_scan_mode)
+    for table_index, discovered in enumerate(discovered_tables, start=1):
+        if job_id:
+            progress = 10 + round((table_index / max(len(discovered_tables), 1)) * 55)
+            update_job_progress(db, tenant_id, job_id, progress, f"Scanning metadata for {discovered.table_name}")
         entity = detect_entity(discovered.table_name, [column.column_name for column in discovered.columns])
         table = MetadataTable(
             tenant_id=tenant_id,
@@ -46,6 +55,7 @@ def run_metadata_scan(db: Session, tenant_id: str, source_system_id: str) -> dic
             schema_name=discovered.schema_name,
             table_name=discovered.table_name,
             row_count=discovered.row_count,
+            row_count_is_estimated=discovered.row_count_is_estimated,
             detected_entity=entity,
             owner=discovered.owner,
             steward=discovered.steward,
@@ -54,6 +64,7 @@ def run_metadata_scan(db: Session, tenant_id: str, source_system_id: str) -> dic
         db.add(table)
         db.flush()
         table_ids_by_name[discovered.table_name] = table.id
+        table_ids_by_schema_name[(discovered.schema_name, discovered.table_name)] = table.id
         table_count += 1
 
         for discovered_column in discovered.columns:
@@ -94,8 +105,12 @@ def run_metadata_scan(db: Session, tenant_id: str, source_system_id: str) -> dic
                 tenant_id=tenant_id,
                 source_system_id=source.id,
                 from_table=relationship.from_table,
+                from_schema=relationship.from_schema,
+                from_table_id=table_ids_by_schema_name.get((relationship.from_schema, relationship.from_table)) or table_ids_by_name.get(relationship.from_table),
                 from_columns=relationship.from_columns,
                 to_table=relationship.to_table,
+                to_schema=relationship.to_schema,
+                to_table_id=table_ids_by_schema_name.get((relationship.to_schema, relationship.to_table)) or table_ids_by_name.get(relationship.to_table),
                 to_columns=relationship.to_columns,
                 relationship_type=relationship.relationship_type,
             )
@@ -130,6 +145,7 @@ def run_metadata_scan(db: Session, tenant_id: str, source_system_id: str) -> dic
         procedure_count += 1
 
     source.status = "scanned"
+    source.scan_mode = effective_scan_mode
     audit(
         db,
         tenant_id,
@@ -145,6 +161,8 @@ def run_metadata_scan(db: Session, tenant_id: str, source_system_id: str) -> dic
         },
     )
     db.commit()
+    if job_id:
+        update_job_progress(db, tenant_id, job_id, 85, "Syncing knowledge graph")
     sync_neo4j_graph(db, tenant_id)
     return {
         "source_system_id": source.id,

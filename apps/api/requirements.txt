@@ -12,3 +12,6 @@ azure-identity==1.25.1
 azure-keyvault-secrets==4.10.0
 neo4j==5.28.2
 pypdf==6.4.1
+PyJWT==2.10.1
+alembic==1.17.2
+pytest==9.0.2

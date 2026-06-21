@@ -41,6 +41,43 @@ class TenantMembership(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class AssessmentProject(Base):
+    __tablename__ = "assessment_projects"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    tenant_id: Mapped[str] = mapped_column(String(36), ForeignKey("tenants.id"), index=True, nullable=False)
+    name: Mapped[str] = mapped_column(String(250), nullable=False)
+    industry: Mapped[str | None] = mapped_column(String(120))
+    primary_goal: Mapped[str | None] = mapped_column(String(120))
+    status: Mapped[str] = mapped_column(String(40), default="active")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class AssessmentProfile(Base):
+    __tablename__ = "assessment_profiles"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    tenant_id: Mapped[str] = mapped_column(String(36), index=True, nullable=False)
+    project_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("assessment_projects.id"), index=True)
+    answers: Mapped[dict] = mapped_column(JSON, default=dict)
+    fabric_score: Mapped[int] = mapped_column(Integer, default=0)
+    databricks_score: Mapped[int] = mapped_column(Integer, default=0)
+    recommended_platform: Mapped[str] = mapped_column(String(80), default="Microsoft Fabric")
+    reasoning: Mapped[list[str]] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class ConnectionSecret(Base):
+    __tablename__ = "connection_secrets"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    tenant_id: Mapped[str] = mapped_column(String(36), index=True, nullable=False)
+    name: Mapped[str] = mapped_column(String(180), nullable=False)
+    provider: Mapped[str] = mapped_column(String(40), nullable=False)
+    reference: Mapped[str] = mapped_column(String(500), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class SourceSystem(Base):
     __tablename__ = "source_systems"
 
@@ -50,7 +87,9 @@ class SourceSystem(Base):
     system_type: Mapped[str] = mapped_column(String(80), nullable=False)
     connection_type: Mapped[str | None] = mapped_column(String(80))
     status: Mapped[str] = mapped_column(String(40), default="registered")
+    secret_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("connection_secrets.id"), index=True)
     secret_reference: Mapped[str | None] = mapped_column(String(500))
+    scan_mode: Mapped[str] = mapped_column(String(40), default="metadata_only")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     tables: Mapped[list["MetadataTable"]] = relationship(cascade="all, delete-orphan")
@@ -66,6 +105,7 @@ class MetadataTable(Base):
     schema_name: Mapped[str | None] = mapped_column(String(120))
     table_name: Mapped[str] = mapped_column(String(180), nullable=False)
     row_count: Mapped[int] = mapped_column(Integer, default=0)
+    row_count_is_estimated: Mapped[bool] = mapped_column(Boolean, default=True)
     detected_entity: Mapped[str | None] = mapped_column(String(120))
     owner: Mapped[str | None] = mapped_column(String(180))
     steward: Mapped[str | None] = mapped_column(String(180))
@@ -110,9 +150,13 @@ class MetadataRelationship(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     tenant_id: Mapped[str] = mapped_column(String(36), index=True, nullable=False)
     source_system_id: Mapped[str] = mapped_column(String(36), ForeignKey("source_systems.id"), index=True, nullable=False)
+    from_table_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("metadata_tables.id"), index=True)
     from_table: Mapped[str] = mapped_column(String(180), nullable=False)
+    from_schema: Mapped[str | None] = mapped_column(String(120))
     from_columns: Mapped[list[str]] = mapped_column(JSON, default=list)
+    to_table_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("metadata_tables.id"), index=True)
     to_table: Mapped[str] = mapped_column(String(180), nullable=False)
+    to_schema: Mapped[str | None] = mapped_column(String(120))
     to_columns: Mapped[list[str]] = mapped_column(JSON, default=list)
     relationship_type: Mapped[str] = mapped_column(String(80), default="FOREIGN_KEY")
     discovered_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
@@ -202,6 +246,22 @@ class Document(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class DocumentExtractedField(Base):
+    __tablename__ = "document_extracted_fields"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    tenant_id: Mapped[str] = mapped_column(String(36), index=True, nullable=False)
+    document_id: Mapped[str] = mapped_column(String(36), ForeignKey("documents.id"), index=True, nullable=False)
+    field_name: Mapped[str] = mapped_column(String(180), nullable=False)
+    value: Mapped[str | None] = mapped_column(Text)
+    confidence: Mapped[float | None] = mapped_column(Float)
+    reference: Mapped[str | None] = mapped_column(Text)
+    page_number: Mapped[int | None] = mapped_column(Integer)
+    reviewed_value: Mapped[str | None] = mapped_column(Text)
+    review_status: Mapped[str] = mapped_column(String(40), default="pending")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class Job(Base):
     __tablename__ = "jobs"
 
@@ -237,4 +297,17 @@ class AuditLog(Base):
     actor: Mapped[str] = mapped_column(String(180), default="portal-user")
     action: Mapped[str] = mapped_column(String(120), nullable=False)
     details: Mapped[dict | None] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class LlmUsageLog(Base):
+    __tablename__ = "llm_usage_logs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    tenant_id: Mapped[str] = mapped_column(String(36), index=True, nullable=False)
+    model: Mapped[str] = mapped_column(String(180), nullable=False)
+    prompt_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    completion_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    estimated_cost: Mapped[float] = mapped_column(Float, default=0)
+    purpose: Mapped[str] = mapped_column(String(120), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

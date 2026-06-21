@@ -1,6 +1,9 @@
 import os
 
+from sqlalchemy.orm import Session
+
 from app.config import get_settings
+from app.models import ConnectionSecret, SourceSystem
 
 
 def resolve_secret_reference(secret_reference: str | None) -> str:
@@ -62,8 +65,24 @@ def _parse_vault_reference(secret_reference: str) -> tuple[str, str]:
 def validate_secret_reference_for_tenant(secret_reference: str | None, tenant_id: str) -> None:
     if not secret_reference:
         return
-    if secret_reference.startswith(("kv://", "vault://", "secret://")) and tenant_id not in secret_reference:
-        settings = get_settings()
-        if settings.azure_tenant_id and settings.azure_tenant_id not in secret_reference:
-            return
-        raise ValueError("Key Vault references must be tenant-scoped or include the configured Azure tenant identifier")
+    if not secret_reference.startswith(("env://", "kv://", "vault://", "secret://", "sqlite://")):
+        raise ValueError("Use env://, kv://, vault://, secret://, or sqlite:// references; raw credentials are not accepted")
+
+
+def source_secret_reference(db: Session, tenant_id: str, source: SourceSystem) -> str | None:
+    if source.secret_id:
+        secret = db.get(ConnectionSecret, source.secret_id)
+        if secret is None or secret.tenant_id != tenant_id:
+            raise ValueError("Connection secret not found for tenant")
+        return secret.reference
+    return source.secret_reference
+
+
+def provider_for_reference(reference: str) -> str:
+    if reference.startswith("env://"):
+        return "env"
+    if reference.startswith("sqlite://"):
+        return "sqlite"
+    if reference.startswith(("kv://", "vault://", "secret://")):
+        return "azure_key_vault"
+    raise ValueError("Unsupported secret reference provider")

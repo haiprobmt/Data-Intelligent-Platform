@@ -5,6 +5,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     app_name: str = "Enterprise Data Intelligence Hub"
+    environment: str = "local"
     database_url: str = "sqlite:///./hub.db"
     default_tenant_id: str = "11111111-1111-4111-8111-111111111111"
     cors_origins: str = "http://localhost:3000"
@@ -23,6 +24,7 @@ class Settings(BaseSettings):
     profile_default_row_limit: int = 10000
     profile_default_max_columns: int = 50
     profile_default_timeout_seconds: int = 30
+    max_upload_size_mb: int = 50
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
@@ -34,3 +36,8 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+def validate_security_settings(settings: Settings) -> None:
+    if settings.environment.lower() not in {"local", "dev", "development"} and settings.auth_jwt_secret in {"", "change-this-secret", "replace_with_a_long_random_secret"}:
+        raise RuntimeError("AUTH_JWT_SECRET must be configured in non-local environments")

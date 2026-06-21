@@ -13,7 +13,7 @@ def generate_recommendations(db: Session, tenant_id: str) -> dict:
 
     db.execute(delete(Recommendation).where(Recommendation.tenant_id == tenant_id))
     platform = choose_platform(tables)
-    bedrock_recommendations = _recommendations_from_bedrock(issues, tables, entities, platform)
+    bedrock_recommendations = _recommendations_from_bedrock(db, tenant_id, issues, tables, entities, platform)
     recommendations = [
         Recommendation(tenant_id=tenant_id, **payload) for payload in bedrock_recommendations
     ] if bedrock_recommendations else [
@@ -232,6 +232,8 @@ def _platform_reason(platform: str) -> str:
 
 
 def _recommendations_from_bedrock(
+    db: Session,
+    tenant_id: str,
     issues: list[DataQualityIssue],
     tables: list[MetadataTable],
     entities: list[str],
@@ -251,7 +253,7 @@ Context:
 
 Keep recommendations practical for Fabric, Databricks, Power BI, governed ingestion, and Bedrock-backed AI use cases.
 """.strip()
-    result = invoke_bedrock_json(prompt, max_tokens=1400)
+    result = invoke_bedrock_json(prompt, max_tokens=1400, db=db, tenant_id=tenant_id, purpose="recommendations")
     if not result or not isinstance(result.get("recommendations"), list):
         return None
     valid: list[dict] = []

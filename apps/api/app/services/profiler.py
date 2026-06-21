@@ -6,9 +6,11 @@ from app.connectors import connector_for_source
 from app.connectors.base import ProfileConfig
 from app.models import DataQualityIssue, MetadataTable, SourceSystem
 from app.services.audit import audit
+from app.services.jobs import update_job_progress
+from app.services.secrets import source_secret_reference
 
 
-def run_profile(db: Session, tenant_id: str, source_system_id: str) -> dict:
+def run_profile(db: Session, tenant_id: str, source_system_id: str, job_id: str | None = None) -> dict:
     source = db.scalar(select(SourceSystem).where(SourceSystem.id == source_system_id, SourceSystem.tenant_id == tenant_id))
     if source is None:
         raise ValueError("Source system not found for tenant")
@@ -21,7 +23,7 @@ def run_profile(db: Session, tenant_id: str, source_system_id: str) -> dict:
     if not tables:
         raise ValueError("Run metadata scan before profiling")
 
-    connector = connector_for_source(source)
+    connector = connector_for_source(source, source_secret_reference(db, tenant_id, source))
     settings = get_settings()
     config = ProfileConfig(
         row_limit=settings.profile_default_row_limit,
@@ -32,14 +34,31 @@ def run_profile(db: Session, tenant_id: str, source_system_id: str) -> dict:
     db.execute(delete(DataQualityIssue).where(DataQualityIssue.tenant_id == tenant_id, DataQualityIssue.table_id.in_(table_ids)))
 
     issues_created = 0
-    for table in tables:
-        real_profiles = connector.profile_columns(
-            table.schema_name or "main",
-            table.table_name,
-            [column.column_name for column in table.columns],
-            table.row_count,
-            config,
-        )
+    for table_index, table in enumerate(tables, start=1):
+        if job_id:
+            progress = 10 + round((table_index / max(len(tables), 1)) * 80)
+            update_job_progress(db, tenant_id, job_id, progress, f"Profiling {table.table_name}")
+        try:
+            real_profiles = connector.profile_columns(
+                table.schema_name or "main",
+                table.table_name,
+                [column.column_name for column in table.columns],
+                table.row_count,
+                config,
+            )
+        except Exception as exc:
+            real_profiles = {}
+            db.add(
+                DataQualityIssue(
+                    tenant_id=tenant_id,
+                    table_id=table.id,
+                    issue_type="Profiling timeout or error",
+                    severity="Medium",
+                    description=f"Profiling for {table.table_name} did not complete within safe limits: {exc}",
+                    recommendation="Reduce profiling scope, increase timeout, or run profiling from an isolated read replica.",
+                )
+            )
+            issues_created += 1
         has_pk = any(column.is_primary_key for column in table.columns)
         has_freshness = any("updated" in column.column_name.lower() or "modified" in column.column_name.lower() for column in table.columns)
 

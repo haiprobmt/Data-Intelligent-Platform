@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -8,10 +8,67 @@ class SourceSystemCreate(BaseModel):
     name: str
     system_type: str
     connection_type: str = "metadata-only"
+    secret_id: str | None = None
+    scan_mode: Literal["metadata_only", "light_profile", "full_profile"] = "metadata_only"
     secret_reference: str | None = Field(
         default=None,
         description="Reference to Key Vault or another secret manager. Raw credentials are not accepted.",
     )
+
+
+class ConnectionSecretCreate(BaseModel):
+    name: str
+    provider: Literal["env", "azure_key_vault", "sqlite"]
+    reference: str
+
+
+class ConnectionSecretOut(BaseModel):
+    id: str
+    tenant_id: str
+    name: str
+    provider: str
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class AssessmentProjectCreate(BaseModel):
+    name: str
+    industry: str | None = None
+    primary_goal: str | None = None
+
+
+class AssessmentProjectOut(BaseModel):
+    id: str
+    tenant_id: str
+    name: str
+    industry: str | None
+    primary_goal: str | None
+    status: str
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class AssessmentProfileIn(BaseModel):
+    project_id: str | None = None
+    current_microsoft_365_usage: bool = False
+    current_power_bi_usage: bool = False
+    current_databricks_usage: bool = False
+    data_volume: Literal["small", "moderate", "large"] = "moderate"
+    streaming_requirement: bool = False
+    ml_ai_requirement: bool = False
+    budget_sensitivity: Literal["low", "medium", "high"] = "medium"
+    engineering_maturity: Literal["low", "medium", "high"] = "medium"
+    governance_maturity: Literal["low", "medium", "high"] = "medium"
+    deployment_preference: Literal["microsoft", "databricks", "neutral"] = "neutral"
+
+
+class AssessmentProfileOut(BaseModel):
+    fabric_score: int
+    databricks_score: int
+    recommended_platform: str
+    reasoning: list[str]
 
 
 class LoginRequest(BaseModel):
@@ -41,7 +98,8 @@ class SourceSystemOut(BaseModel):
     system_type: str
     connection_type: str | None
     status: str
-    secret_reference: str | None
+    secret_id: str | None
+    scan_mode: str
     created_at: datetime
 
     model_config = {"from_attributes": True}
@@ -94,6 +152,7 @@ class MetadataTableOut(BaseModel):
     schema_name: str | None
     table_name: str
     row_count: int
+    row_count_is_estimated: bool
     detected_entity: str | None
     columns: list[MetadataColumnOut] = []
 
@@ -172,6 +231,25 @@ class DocumentOut(BaseModel):
     extraction_metadata: dict[str, Any] | None
     confidence_score: float | None
     approved_at: datetime | None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class DocumentReviewPatch(BaseModel):
+    fields: dict[str, Any]
+
+
+class DocumentExtractedFieldOut(BaseModel):
+    id: str
+    document_id: str
+    field_name: str
+    value: str | None
+    confidence: float | None
+    reference: str | None
+    page_number: int | None
+    reviewed_value: str | None
+    review_status: str
     created_at: datetime
 
     model_config = {"from_attributes": True}

@@ -21,6 +21,7 @@ class TableMetadata:
     table_name: str
     row_count: int
     columns: list[ColumnMetadata]
+    row_count_is_estimated: bool = True
     owner: str | None = None
     steward: str | None = None
     source_freshness_at: datetime | None = None
@@ -40,6 +41,8 @@ class RelationshipMetadata:
     from_columns: list[str]
     to_table: str
     to_columns: list[str]
+    from_schema: str | None = None
+    to_schema: str | None = None
     relationship_type: str = "FOREIGN_KEY"
 
 
@@ -79,7 +82,7 @@ class BaseConnector(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def list_tables(self) -> list[TableMetadata]:
+    def list_tables(self, scan_mode: str = "metadata_only") -> list[TableMetadata]:
         raise NotImplementedError
 
     def list_indexes(self) -> list[IndexMetadata]:

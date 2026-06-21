@@ -18,7 +18,7 @@ class FileConnector(BaseConnector):
     def list_schemas(self) -> list[str]:
         return ["uploaded"]
 
-    def list_tables(self) -> list[TableMetadata]:
+    def list_tables(self, scan_mode: str = "metadata_only") -> list[TableMetadata]:
         rows, columns = self._read_rows()
         return [
             TableMetadata(
@@ -26,6 +26,7 @@ class FileConnector(BaseConnector):
                 schema_name="uploaded",
                 table_name=self.file_path.stem,
                 row_count=len(rows),
+                row_count_is_estimated=False,
                 columns=[ColumnMetadata(column, _infer_type([row.get(column) for row in rows]), True, False, False, None) for column in columns],
             )
         ]
