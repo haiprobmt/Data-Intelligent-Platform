@@ -1,0 +1,13 @@
+{
+  "name": "enterprise-data-intelligence-hub",
+  "private": true,
+  "scripts": {
+    "dev:web": "npm --prefix apps/web run dev",
+    "build:web": "npm --prefix apps/web run build",
+    "lint:web": "npm --prefix apps/web run lint",
+    "dev:api": "python -m uvicorn app.main:app --app-dir apps/api --reload --port 8000"
+  },
+  "workspaces": [
+    "apps/web"
+  ]
+}
