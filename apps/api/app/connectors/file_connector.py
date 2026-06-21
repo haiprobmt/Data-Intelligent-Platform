@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from app.connectors.base import BaseConnector, ColumnMetadata, TableMetadata
+from app.connectors.base import BaseConnector, ColumnMetadata, ProfileConfig, TableMetadata
 
 
 class FileConnector(BaseConnector):
@@ -30,16 +30,18 @@ class FileConnector(BaseConnector):
             )
         ]
 
-    def profile_columns(self, schema_name: str, table_name: str, columns: list[str], row_count: int) -> dict[str, dict[str, Any]]:
+    def profile_columns(self, schema_name: str, table_name: str, columns: list[str], row_count: int, config: ProfileConfig) -> dict[str, dict[str, Any]]:
         rows, _columns = self._read_rows()
+        rows = rows[: config.row_limit]
         profiles: dict[str, dict[str, Any]] = {}
-        for column in columns:
+        for column in columns[: config.max_columns]:
             values = [row.get(column) for row in rows]
             null_count = sum(1 for value in values if value in (None, ""))
             distinct_values = {str(value) for value in values if value not in (None, "")}
             profiles[column] = {
-                "null_percentage": round((null_count / row_count) * 100, 2) if row_count else 0,
+                "null_percentage": round((null_count / len(rows)) * 100, 2) if rows else 0,
                 "distinct_count": len(distinct_values),
+                "sampled_row_count": len(rows),
             }
         return profiles
 

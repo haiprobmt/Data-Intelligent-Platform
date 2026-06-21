@@ -97,6 +97,30 @@ def generate_poc_assets(db: Session, tenant_id: str) -> dict:
             file_path="generated/ai/rag-design.md",
             content="Use Amazon Bedrock embeddings and model invocation for approved document extractions, metadata descriptions, tenant-scoped retrieval filters, and evaluation checks.",
         ),
+        PocAsset(
+            tenant_id=tenant_id,
+            platform=platform,
+            asset_type="Warehouse DDL",
+            asset_name="Silver Quality Tables DDL",
+            file_path="generated/sql/silver_quality_tables.sql",
+            content=silver_quality_ddl(),
+        ),
+        PocAsset(
+            tenant_id=tenant_id,
+            platform=platform,
+            asset_type="Pipeline definition",
+            asset_name="Metadata-to-Lakehouse Pipeline",
+            file_path="generated/pipelines/metadata_ingestion_pipeline.json",
+            content=pipeline_definition(platform),
+        ),
+        PocAsset(
+            tenant_id=tenant_id,
+            platform=platform,
+            asset_type="dbt model",
+            asset_name="Entity Quality Mart",
+            file_path="generated/dbt/models/entity_quality_mart.sql",
+            content=dbt_entity_quality_model(),
+        ),
     ]
     db.add_all(assets)
     audit(db, tenant_id, "poc.generate", {"count": len(assets), "platform": platform})
@@ -107,7 +131,21 @@ def generate_poc_assets(db: Session, tenant_id: str) -> dict:
 def choose_platform(tables: list[MetadataTable]) -> str:
     total_rows = sum(table.row_count for table in tables)
     table_names = " ".join(table.table_name.lower() for table in tables)
-    if total_rows > 2_000_000 or "stream" in table_names:
+    fabric_score = 0
+    databricks_score = 0
+    if any(term in table_names for term in ["powerbi", "semantic", "report", "finance", "customer"]):
+        fabric_score += 3
+    if any(term in table_names for term in ["stream", "event", "telemetry", "clickstream", "iot"]):
+        databricks_score += 4
+    if total_rows > 2_000_000:
+        databricks_score += 3
+    else:
+        fabric_score += 2
+    if any(table.detected_entity in {"Customer", "Funding", "Invoice"} for table in tables):
+        fabric_score += 1
+    if len(tables) > 100:
+        databricks_score += 1
+    if databricks_score > fabric_score:
         return "Databricks"
     return "Microsoft Fabric"
 
@@ -139,6 +177,52 @@ silver = (
 )
 silver.write.mode("overwrite").saveAsTable("silver.customer_master")
 """
+
+
+def silver_quality_ddl() -> str:
+        return """CREATE TABLE IF NOT EXISTS silver.entity_quality_score (
+        tenant_id STRING NOT NULL,
+        source_system_id STRING NOT NULL,
+        entity_name STRING NOT NULL,
+        completeness_score INT,
+        uniqueness_score INT,
+        freshness_score INT,
+        validity_score INT,
+        consistency_score INT,
+        overall_score INT,
+        scored_at TIMESTAMP
+);
+"""
+
+
+def pipeline_definition(platform: str) -> str:
+        return """{
+    "name": "metadata-to-lakehouse-assessment",
+    "platform": """ + json_quote(platform) + """,
+    "activities": [
+        {"name": "scan_metadata", "type": "connector_scan"},
+        {"name": "profile_quality", "type": "quality_profile", "dependsOn": ["scan_metadata"]},
+        {"name": "sync_knowledge_graph", "type": "neo4j_sync", "dependsOn": ["profile_quality"]},
+        {"name": "generate_recommendations", "type": "bedrock_analysis", "dependsOn": ["sync_knowledge_graph"]}
+    ]
+}
+"""
+
+
+def dbt_entity_quality_model() -> str:
+        return """select
+        tenant_id,
+        detected_entity as entity_name,
+        count(*) as table_count,
+        avg(row_count) as average_row_count
+from {{ ref('metadata_tables') }}
+where detected_entity is not null
+group by tenant_id, detected_entity
+"""
+
+
+def json_quote(value: str) -> str:
+        return '"' + value.replace('"', '\\"') + '"'
 
 
 def _platform_reason(platform: str) -> str:

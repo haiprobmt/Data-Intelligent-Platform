@@ -6,32 +6,39 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.config import get_settings
-from app.database import Base, engine, get_db
-from app.models import DataQualityIssue, Document, Job, MetadataTable, PocAsset, Recommendation, SourceSystem, Tenant
+from app.database import Base, SessionLocal, engine, get_db
+from app.models import DataQualityIssue, Document, Job, JobLog, MetadataTable, PocAsset, Recommendation, SourceSystem, Tenant, TenantMembership, User
 from app.schemas import (
     DashboardSnapshot,
     CopilotAnswer,
     CopilotQuestion,
+    CurrentUserOut,
     DocumentOut,
     DocumentUpload,
     IssueOut,
+    JobLogOut,
     JobOut,
+    LoginRequest,
     MetadataTableOut,
     PocAssetOut,
     RecommendationOut,
     SourceSystemCreate,
     SourceSystemOut,
+    TokenOut,
     default_document_schema,
 )
-from app.security import get_tenant_id
+from app.security import AuthContext, create_access_token, get_auth_context, require_role, verify_password
 from app.services.audit import audit
 from app.services.bedrock import invoke_bedrock_text
+from app.services.bootstrap import bootstrap_admin_user
 from app.services.documents import approve_document, extract_document
 from app.services.graph import graph_entities, graph_issues, graph_lineage
-from app.services.jobs import enqueue_job
+from app.services.jobs import enqueue_job, request_job_cancel
 from app.services.profiler import quality_scores, run_profile
 from app.services.recommendations import architecture_mermaid, generate_poc_assets, generate_recommendations
 from app.services.scanner import run_metadata_scan
+from app.services.schema_compat import ensure_schema_compat
+from app.services.secrets import validate_secret_reference_for_tenant
 from app.services.uploads import save_uploaded_file, validate_source_file
 
 settings = get_settings()
@@ -48,6 +55,9 @@ app.add_middleware(
 @app.on_event("startup")
 def startup() -> None:
     Base.metadata.create_all(bind=engine)
+    ensure_schema_compat(engine)
+    with SessionLocal() as db:
+        bootstrap_admin_user(db)
 
 
 def ensure_tenant(db: Session, tenant_id: str) -> None:
@@ -62,8 +72,32 @@ def health() -> dict[str, str]:
     return {"status": "ok", "service": settings.app_name}
 
 
+@app.post("/api/auth/login", response_model=TokenOut)
+def login(payload: LoginRequest, db: Session = Depends(get_db)) -> TokenOut:
+    user = db.scalar(select(User).where(User.email == payload.email.lower().strip(), User.is_active.is_(True)))
+    if user is None or not verify_password(payload.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    membership_query = select(TenantMembership).where(TenantMembership.user_id == user.id)
+    if payload.tenant_id:
+        membership_query = membership_query.where(TenantMembership.tenant_id == payload.tenant_id)
+    membership = db.scalar(membership_query.order_by(TenantMembership.created_at.asc()))
+    if membership is None:
+        raise HTTPException(status_code=403, detail="User does not belong to the requested tenant")
+    token = create_access_token(user, membership.tenant_id, membership.role)
+    return TokenOut(access_token=token, tenant_id=membership.tenant_id, role=membership.role)
+
+
+@app.get("/api/auth/me", response_model=CurrentUserOut)
+def me(context: AuthContext = Depends(get_auth_context)) -> CurrentUserOut:
+    return CurrentUserOut(user_id=context.user_id, email=context.email, tenant_id=context.tenant_id, role=context.role)
+
+
 @app.get("/api/dashboard", response_model=DashboardSnapshot)
-def dashboard(tenant_id: str = Depends(get_tenant_id), db: Session = Depends(get_db)) -> DashboardSnapshot:
+def dashboard(context: AuthContext = Depends(get_auth_context), db: Session = Depends(get_db)) -> DashboardSnapshot:
+    return dashboard_snapshot(db, context.tenant_id)
+
+
+def dashboard_snapshot(db: Session, tenant_id: str) -> DashboardSnapshot:
     ensure_tenant(db, tenant_id)
     source_count = db.scalar(select(func.count(SourceSystem.id)).where(SourceSystem.tenant_id == tenant_id)) or 0
     table_count = db.scalar(select(func.count(MetadataTable.id)).where(MetadataTable.tenant_id == tenant_id)) or 0
@@ -94,10 +128,15 @@ def dashboard(tenant_id: str = Depends(get_tenant_id), db: Session = Depends(get
 
 
 @app.post("/api/source-systems", response_model=SourceSystemOut)
-def create_source_system(payload: SourceSystemCreate, tenant_id: str = Depends(get_tenant_id), db: Session = Depends(get_db)) -> SourceSystem:
+def create_source_system(payload: SourceSystemCreate, context: AuthContext = Depends(require_role("analyst")), db: Session = Depends(get_db)) -> SourceSystem:
+    tenant_id = context.tenant_id
     ensure_tenant(db, tenant_id)
     if payload.secret_reference and not payload.secret_reference.startswith(("kv://", "vault://", "secret://", "env://", "sqlite://")):
         raise HTTPException(status_code=400, detail="Provide a secret reference, not raw credentials")
+    try:
+        validate_secret_reference_for_tenant(payload.secret_reference, tenant_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     source = SourceSystem(tenant_id=tenant_id, **payload.model_dump())
     db.add(source)
     audit(db, tenant_id, "source.create", {"name": source.name, "system_type": source.system_type})
@@ -111,9 +150,10 @@ async def upload_source_file(
     system_type: str = Form(...),
     sheet_or_delimiter: str | None = Form(default=None),
     file: UploadFile = File(...),
-    tenant_id: str = Depends(get_tenant_id),
+    context: AuthContext = Depends(require_role("analyst")),
     db: Session = Depends(get_db),
 ) -> SourceSystem:
+    tenant_id = context.tenant_id
     ensure_tenant(db, tenant_id)
     validate_source_file(system_type, file.filename or "")
     stored_path = await save_uploaded_file(file, tenant_id, "sources")
@@ -133,12 +173,14 @@ async def upload_source_file(
 
 
 @app.get("/api/source-systems", response_model=list[SourceSystemOut])
-def list_source_systems(tenant_id: str = Depends(get_tenant_id), db: Session = Depends(get_db)) -> list[SourceSystem]:
+def list_source_systems(context: AuthContext = Depends(get_auth_context), db: Session = Depends(get_db)) -> list[SourceSystem]:
+    tenant_id = context.tenant_id
     return db.scalars(select(SourceSystem).where(SourceSystem.tenant_id == tenant_id).order_by(SourceSystem.created_at.desc())).all()
 
 
 @app.get("/api/source-systems/{source_system_id}", response_model=SourceSystemOut)
-def get_source_system(source_system_id: str, tenant_id: str = Depends(get_tenant_id), db: Session = Depends(get_db)) -> SourceSystem:
+def get_source_system(source_system_id: str, context: AuthContext = Depends(get_auth_context), db: Session = Depends(get_db)) -> SourceSystem:
+    tenant_id = context.tenant_id
     source = db.get(SourceSystem, source_system_id)
     if source is None or source.tenant_id != tenant_id:
         raise HTTPException(status_code=404, detail="Source system not found")
@@ -146,7 +188,8 @@ def get_source_system(source_system_id: str, tenant_id: str = Depends(get_tenant
 
 
 @app.delete("/api/source-systems/{source_system_id}")
-def delete_source_system(source_system_id: str, tenant_id: str = Depends(get_tenant_id), db: Session = Depends(get_db)) -> dict[str, str]:
+def delete_source_system(source_system_id: str, context: AuthContext = Depends(require_role("admin")), db: Session = Depends(get_db)) -> dict[str, str]:
+    tenant_id = context.tenant_id
     source = db.get(SourceSystem, source_system_id)
     if source is None or source.tenant_id != tenant_id:
         raise HTTPException(status_code=404, detail="Source system not found")
@@ -157,7 +200,8 @@ def delete_source_system(source_system_id: str, tenant_id: str = Depends(get_ten
 
 
 @app.post("/api/source-systems/{source_system_id}/scan", response_model=JobOut)
-def scan_source_system(source_system_id: str, background_tasks: BackgroundTasks, tenant_id: str = Depends(get_tenant_id), db: Session = Depends(get_db)) -> Job:
+def scan_source_system(source_system_id: str, background_tasks: BackgroundTasks, context: AuthContext = Depends(require_role("analyst")), db: Session = Depends(get_db)) -> Job:
+    tenant_id = context.tenant_id
     return enqueue_job(
         background_tasks,
         db,
@@ -169,19 +213,22 @@ def scan_source_system(source_system_id: str, background_tasks: BackgroundTasks,
 
 
 @app.get("/api/scans/{scan_id}/status", response_model=JobOut)
-def scan_status(scan_id: str, tenant_id: str = Depends(get_tenant_id), db: Session = Depends(get_db)) -> Job:
+def scan_status(scan_id: str, context: AuthContext = Depends(get_auth_context), db: Session = Depends(get_db)) -> Job:
+    tenant_id = context.tenant_id
     return get_job_or_404(db, tenant_id, scan_id)
 
 
 @app.get("/api/scans/{scan_id}/results")
-def scan_results(scan_id: str, tenant_id: str = Depends(get_tenant_id), db: Session = Depends(get_db)) -> dict:
+def scan_results(scan_id: str, context: AuthContext = Depends(get_auth_context), db: Session = Depends(get_db)) -> dict:
+    tenant_id = context.tenant_id
     job = get_job_or_404(db, tenant_id, scan_id)
     tables = db.scalars(select(MetadataTable).options(selectinload(MetadataTable.columns)).where(MetadataTable.tenant_id == tenant_id)).all()
     return {"job": JobOut.model_validate(job), "tables": [MetadataTableOut.model_validate(table) for table in tables]}
 
 
 @app.post("/api/source-systems/{source_system_id}/profile", response_model=JobOut)
-def profile_source_system(source_system_id: str, background_tasks: BackgroundTasks, tenant_id: str = Depends(get_tenant_id), db: Session = Depends(get_db)) -> Job:
+def profile_source_system(source_system_id: str, background_tasks: BackgroundTasks, context: AuthContext = Depends(require_role("analyst")), db: Session = Depends(get_db)) -> Job:
+    tenant_id = context.tenant_id
     return enqueue_job(
         background_tasks,
         db,
@@ -193,7 +240,8 @@ def profile_source_system(source_system_id: str, background_tasks: BackgroundTas
 
 
 @app.get("/api/profiles/{profile_id}", response_model=JobOut)
-def profile_status(profile_id: str, tenant_id: str = Depends(get_tenant_id), db: Session = Depends(get_db)) -> Job:
+def profile_status(profile_id: str, context: AuthContext = Depends(get_auth_context), db: Session = Depends(get_db)) -> Job:
+    tenant_id = context.tenant_id
     return get_job_or_404(db, tenant_id, profile_id)
 
 
@@ -202,11 +250,12 @@ async def upload_document(
     file: UploadFile = File(...),
     document_type: str = Form(default="Funding agreement"),
     target_schema_json: str | None = Form(default=None),
-    tenant_id: str = Depends(get_tenant_id),
+    context: AuthContext = Depends(require_role("analyst")),
     db: Session = Depends(get_db),
 ) -> Document:
+    tenant_id = context.tenant_id
     ensure_tenant(db, tenant_id)
-    await save_uploaded_file(file, tenant_id, "documents")
+    stored_path = await save_uploaded_file(file, tenant_id, "documents")
     target_schema = default_document_schema()
     if target_schema_json:
         try:
@@ -217,7 +266,7 @@ async def upload_document(
             raise HTTPException(status_code=400, detail="target_schema_json must be a JSON object")
         target_schema = parsed_schema
     document_payload = DocumentUpload(file_name=file.filename or "uploaded-document", document_type=document_type, target_schema=target_schema)
-    document = Document(tenant_id=tenant_id, **document_payload.model_dump())
+    document = Document(tenant_id=tenant_id, file_path=str(stored_path), **document_payload.model_dump())
     db.add(document)
     audit(db, tenant_id, "document.upload", {"file_name": document.file_name})
     db.commit()
@@ -226,15 +275,16 @@ async def upload_document(
 
 
 @app.post("/api/documents/{document_id}/extract")
-def document_extract(document_id: str, tenant_id: str = Depends(get_tenant_id), db: Session = Depends(get_db)) -> dict:
+def document_extract(document_id: str, context: AuthContext = Depends(require_role("analyst")), db: Session = Depends(get_db)) -> dict:
     try:
-        return extract_document(db, tenant_id, document_id)
+        return extract_document(db, context.tenant_id, document_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @app.get("/api/documents/{document_id}/extraction-result", response_model=DocumentOut)
-def document_result(document_id: str, tenant_id: str = Depends(get_tenant_id), db: Session = Depends(get_db)) -> Document:
+def document_result(document_id: str, context: AuthContext = Depends(get_auth_context), db: Session = Depends(get_db)) -> Document:
+    tenant_id = context.tenant_id
     document = db.get(Document, document_id)
     if document is None or document.tenant_id != tenant_id:
         raise HTTPException(status_code=404, detail="Document not found")
@@ -242,21 +292,21 @@ def document_result(document_id: str, tenant_id: str = Depends(get_tenant_id), d
 
 
 @app.post("/api/documents/{document_id}/approve", response_model=DocumentOut)
-def document_approve(document_id: str, tenant_id: str = Depends(get_tenant_id), db: Session = Depends(get_db)) -> Document:
+def document_approve(document_id: str, context: AuthContext = Depends(require_role("analyst")), db: Session = Depends(get_db)) -> Document:
     try:
-        return approve_document(db, tenant_id, document_id)
+        return approve_document(db, context.tenant_id, document_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/graph/entities")
-def get_graph_entities(tenant_id: str = Depends(get_tenant_id), db: Session = Depends(get_db)) -> list[dict]:
-    return graph_entities(db, tenant_id)
+def get_graph_entities(context: AuthContext = Depends(get_auth_context), db: Session = Depends(get_db)) -> list[dict]:
+    return graph_entities(db, context.tenant_id)
 
 
 @app.get("/api/graph/entity/{entity_id}")
-def get_graph_entity(entity_id: str, tenant_id: str = Depends(get_tenant_id), db: Session = Depends(get_db)) -> dict:
-    entities = graph_entities(db, tenant_id)
+def get_graph_entity(entity_id: str, context: AuthContext = Depends(get_auth_context), db: Session = Depends(get_db)) -> dict:
+    entities = graph_entities(db, context.tenant_id)
     for entity in entities:
         if entity["id"] == entity_id:
             return entity
@@ -264,17 +314,18 @@ def get_graph_entity(entity_id: str, tenant_id: str = Depends(get_tenant_id), db
 
 
 @app.get("/api/graph/lineage/{entity_id}")
-def get_lineage(entity_id: str, tenant_id: str = Depends(get_tenant_id), db: Session = Depends(get_db)) -> dict:
-    return graph_lineage(db, tenant_id, entity_id)
+def get_lineage(entity_id: str, context: AuthContext = Depends(get_auth_context), db: Session = Depends(get_db)) -> dict:
+    return graph_lineage(db, context.tenant_id, entity_id)
 
 
 @app.get("/api/graph/issues")
-def get_graph_issues(tenant_id: str = Depends(get_tenant_id), db: Session = Depends(get_db)) -> list[dict]:
-    return graph_issues(db, tenant_id)
+def get_graph_issues(context: AuthContext = Depends(get_auth_context), db: Session = Depends(get_db)) -> list[dict]:
+    return graph_issues(db, context.tenant_id)
 
 
 @app.post("/api/agents/analyze", response_model=JobOut)
-def analyze(background_tasks: BackgroundTasks, tenant_id: str = Depends(get_tenant_id), db: Session = Depends(get_db)) -> Job:
+def analyze(background_tasks: BackgroundTasks, context: AuthContext = Depends(require_role("analyst")), db: Session = Depends(get_db)) -> Job:
+    tenant_id = context.tenant_id
     def task(task_db: Session, task_tenant_id: str, _job_id: str) -> dict:
         sources = task_db.scalars(select(SourceSystem).where(SourceSystem.tenant_id == task_tenant_id)).all()
         for source in sources:
@@ -288,18 +339,19 @@ def analyze(background_tasks: BackgroundTasks, tenant_id: str = Depends(get_tena
 
 
 @app.post("/api/agents/recommend")
-def recommend(tenant_id: str = Depends(get_tenant_id), db: Session = Depends(get_db)) -> dict:
-    return generate_recommendations(db, tenant_id)
+def recommend(context: AuthContext = Depends(require_role("analyst")), db: Session = Depends(get_db)) -> dict:
+    return generate_recommendations(db, context.tenant_id)
 
 
 @app.post("/api/agents/generate-poc")
-def generate_poc(tenant_id: str = Depends(get_tenant_id), db: Session = Depends(get_db)) -> dict:
-    return generate_poc_assets(db, tenant_id)
+def generate_poc(context: AuthContext = Depends(require_role("analyst")), db: Session = Depends(get_db)) -> dict:
+    return generate_poc_assets(db, context.tenant_id)
 
 
 @app.post("/api/agents/copilot", response_model=CopilotAnswer)
-def copilot(payload: CopilotQuestion, tenant_id: str = Depends(get_tenant_id), db: Session = Depends(get_db)) -> CopilotAnswer:
-    snapshot = dashboard(tenant_id, db).model_dump(mode="json")
+def copilot(payload: CopilotQuestion, context: AuthContext = Depends(get_auth_context), db: Session = Depends(get_db)) -> CopilotAnswer:
+    tenant_id = context.tenant_id
+    snapshot = dashboard_snapshot(db, tenant_id).model_dump(mode="json")
     prompt = f"""
 You are the AI copilot for an enterprise data assessment portal.
 Answer the user's question using only this assessment snapshot. Be concise and practical.
@@ -316,39 +368,54 @@ Snapshot JSON: {json.dumps(snapshot, ensure_ascii=False)}
 
 
 @app.get("/api/agents/jobs/{job_id}", response_model=JobOut)
-def agent_job(job_id: str, tenant_id: str = Depends(get_tenant_id), db: Session = Depends(get_db)) -> Job:
-    return get_job_or_404(db, tenant_id, job_id)
+def agent_job(job_id: str, context: AuthContext = Depends(get_auth_context), db: Session = Depends(get_db)) -> Job:
+    return get_job_or_404(db, context.tenant_id, job_id)
+
+
+@app.post("/api/agents/jobs/{job_id}/cancel", response_model=JobOut)
+def cancel_job(job_id: str, context: AuthContext = Depends(require_role("analyst")), db: Session = Depends(get_db)) -> Job:
+    try:
+        return request_job_cancel(db, context.tenant_id, job_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/agents/jobs/{job_id}/logs", response_model=list[JobLogOut])
+def job_logs(job_id: str, context: AuthContext = Depends(get_auth_context), db: Session = Depends(get_db)) -> list[JobLog]:
+    get_job_or_404(db, context.tenant_id, job_id)
+    return db.scalars(select(JobLog).where(JobLog.tenant_id == context.tenant_id, JobLog.job_id == job_id).order_by(JobLog.created_at.asc())).all()
 
 
 @app.post("/api/reports/generate")
-def generate_report(tenant_id: str = Depends(get_tenant_id), db: Session = Depends(get_db)) -> dict:
-    snapshot = dashboard(tenant_id, db)
+def generate_report(context: AuthContext = Depends(get_auth_context), db: Session = Depends(get_db)) -> dict:
+    tenant_id = context.tenant_id
+    snapshot = dashboard_snapshot(db, tenant_id)
     return {"report_id": f"assessment-{tenant_id}", "snapshot": snapshot.model_dump(mode="json")}
 
 
 @app.get("/api/reports/{report_id}")
-def get_report(report_id: str, tenant_id: str = Depends(get_tenant_id), db: Session = Depends(get_db)) -> dict:
-    return {"report_id": report_id, "snapshot": dashboard(tenant_id, db).model_dump(mode="json")}
+def get_report(report_id: str, context: AuthContext = Depends(get_auth_context), db: Session = Depends(get_db)) -> dict:
+    return {"report_id": report_id, "snapshot": dashboard_snapshot(db, context.tenant_id).model_dump(mode="json")}
 
 
 @app.get("/api/reports/{report_id}/download")
-def download_report(report_id: str, tenant_id: str = Depends(get_tenant_id), db: Session = Depends(get_db)) -> dict:
-    return {"report_id": report_id, "format": "json", "content": dashboard(tenant_id, db).model_dump(mode="json")}
+def download_report(report_id: str, context: AuthContext = Depends(get_auth_context), db: Session = Depends(get_db)) -> dict:
+    return {"report_id": report_id, "format": "json", "content": dashboard_snapshot(db, context.tenant_id).model_dump(mode="json")}
 
 
 @app.get("/api/issues", response_model=list[IssueOut])
-def list_issues(tenant_id: str = Depends(get_tenant_id), db: Session = Depends(get_db)) -> list[DataQualityIssue]:
-    return db.scalars(select(DataQualityIssue).where(DataQualityIssue.tenant_id == tenant_id)).all()
+def list_issues(context: AuthContext = Depends(get_auth_context), db: Session = Depends(get_db)) -> list[DataQualityIssue]:
+    return db.scalars(select(DataQualityIssue).where(DataQualityIssue.tenant_id == context.tenant_id)).all()
 
 
 @app.get("/api/recommendations", response_model=list[RecommendationOut])
-def list_recommendations(tenant_id: str = Depends(get_tenant_id), db: Session = Depends(get_db)) -> list[Recommendation]:
-    return db.scalars(select(Recommendation).where(Recommendation.tenant_id == tenant_id)).all()
+def list_recommendations(context: AuthContext = Depends(get_auth_context), db: Session = Depends(get_db)) -> list[Recommendation]:
+    return db.scalars(select(Recommendation).where(Recommendation.tenant_id == context.tenant_id)).all()
 
 
 @app.get("/api/poc-assets", response_model=list[PocAssetOut])
-def list_poc_assets(tenant_id: str = Depends(get_tenant_id), db: Session = Depends(get_db)) -> list[PocAsset]:
-    return db.scalars(select(PocAsset).where(PocAsset.tenant_id == tenant_id)).all()
+def list_poc_assets(context: AuthContext = Depends(get_auth_context), db: Session = Depends(get_db)) -> list[PocAsset]:
+    return db.scalars(select(PocAsset).where(PocAsset.tenant_id == context.tenant_id)).all()
 
 
 def get_job_or_404(db: Session, tenant_id: str, job_id: str) -> Job:

@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 
@@ -20,6 +21,48 @@ class TableMetadata:
     table_name: str
     row_count: int
     columns: list[ColumnMetadata]
+    owner: str | None = None
+    steward: str | None = None
+    source_freshness_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class IndexMetadata:
+    table_name: str
+    index_name: str
+    column_names: list[str]
+    is_unique: bool = False
+
+
+@dataclass(frozen=True)
+class RelationshipMetadata:
+    from_table: str
+    from_columns: list[str]
+    to_table: str
+    to_columns: list[str]
+    relationship_type: str = "FOREIGN_KEY"
+
+
+@dataclass(frozen=True)
+class ViewMetadata:
+    database_name: str | None
+    schema_name: str | None
+    view_name: str
+    definition: str | None = None
+
+
+@dataclass(frozen=True)
+class ProcedureMetadata:
+    schema_name: str | None
+    procedure_name: str
+    definition: str | None = None
+
+
+@dataclass(frozen=True)
+class ProfileConfig:
+    row_limit: int
+    max_columns: int
+    timeout_seconds: int
 
 
 class BaseConnector(ABC):
@@ -39,5 +82,17 @@ class BaseConnector(ABC):
     def list_tables(self) -> list[TableMetadata]:
         raise NotImplementedError
 
-    def profile_columns(self, schema_name: str, table_name: str, columns: list[str], row_count: int) -> dict[str, dict[str, Any]]:
+    def list_indexes(self) -> list[IndexMetadata]:
+        return []
+
+    def list_relationships(self) -> list[RelationshipMetadata]:
+        return []
+
+    def list_views(self) -> list[ViewMetadata]:
+        return []
+
+    def list_procedures(self) -> list[ProcedureMetadata]:
+        return []
+
+    def profile_columns(self, schema_name: str, table_name: str, columns: list[str], row_count: int, config: ProfileConfig) -> dict[str, dict[str, Any]]:
         return {}

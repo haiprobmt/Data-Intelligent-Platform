@@ -14,6 +14,26 @@ class SourceSystemCreate(BaseModel):
     )
 
 
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+    tenant_id: str | None = None
+
+
+class TokenOut(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    tenant_id: str
+    role: str
+
+
+class CurrentUserOut(BaseModel):
+    user_id: str
+    email: str
+    tenant_id: str
+    role: str
+
+
 class SourceSystemOut(BaseModel):
     id: str
     tenant_id: str
@@ -34,8 +54,21 @@ class JobOut(BaseModel):
     status: str
     message: str | None
     result: dict[str, Any] | None
+    progress_percent: int = 0
+    cancel_requested: bool = False
     created_at: datetime
     updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class JobLogOut(BaseModel):
+    id: str
+    job_id: str
+    level: str
+    message: str
+    details: dict[str, Any] | None
+    created_at: datetime
 
     model_config = {"from_attributes": True}
 
@@ -130,10 +163,13 @@ def default_document_schema() -> dict[str, Any]:
 class DocumentOut(BaseModel):
     id: str
     file_name: str
+    file_path: str | None
     document_type: str
     status: str
     target_schema: dict[str, Any] | None
+    extracted_text: str | None
     extracted_fields: dict[str, Any] | None
+    extraction_metadata: dict[str, Any] | None
     confidence_score: float | None
     approved_at: datetime | None
     created_at: datetime

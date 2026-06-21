@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 from app.models import Document
 from app.services.audit import audit
 from app.services.bedrock import invoke_bedrock_json
+from app.services.document_text import extract_text_from_file
 
 
 def extract_document(db: Session, tenant_id: str, document_id: str) -> dict:
@@ -13,15 +14,29 @@ def extract_document(db: Session, tenant_id: str, document_id: str) -> dict:
         raise ValueError("Document not found for tenant")
 
     columns = (document.target_schema or {}).get("columns", [])
-    bedrock_result = _extract_with_bedrock(document.file_name, document.document_type, columns)
+    extracted_text, extraction_metadata = extract_text_from_file(document.file_path)
+    document.extracted_text = extracted_text
+    document.extraction_metadata = extraction_metadata
+    bedrock_result = _extract_with_bedrock(document.file_name, document.document_type, columns, extracted_text)
     extracted = bedrock_result.get("fields") if bedrock_result else None
     confidence = bedrock_result.get("confidence_score") if bedrock_result else None
     document.extracted_fields = extracted if isinstance(extracted, dict) else {column: "Requires Bedrock review" for column in columns}
     document.confidence_score = float(confidence) if isinstance(confidence, (int, float)) else 0.0
     document.status = "needs_review"
-    audit(db, tenant_id, "document.extract", {"document_id": document.id, "confidence": document.confidence_score})
+    audit(
+        db,
+        tenant_id,
+        "document.extract",
+        {"document_id": document.id, "confidence": document.confidence_score, "text_characters": len(extracted_text)},
+    )
     db.commit()
-    return {"document_id": document.id, "confidence_score": document.confidence_score, "fields": extracted}
+    return {
+        "document_id": document.id,
+        "confidence_score": document.confidence_score,
+        "fields": document.extracted_fields,
+        "text_characters": len(extracted_text),
+        "extraction_metadata": extraction_metadata,
+    }
 
 
 def approve_document(db: Session, tenant_id: str, document_id: str) -> Document:
@@ -38,13 +53,17 @@ def approve_document(db: Session, tenant_id: str, document_id: str) -> Document:
     return document
 
 
-def _extract_with_bedrock(file_name: str, document_type: str, columns: list[str]) -> dict | None:
+def _extract_with_bedrock(file_name: str, document_type: str, columns: list[str], extracted_text: str) -> dict | None:
+    text_for_prompt = extracted_text[:18000]
     prompt = f"""
 You are extracting structured data for an enterprise data assessment portal.
 The uploaded file is named {file_name!r} and was classified as {document_type!r}.
 Return strict JSON only with this shape:
-{{"confidence_score": 0.0, "fields": {{"column_name": "value"}}}}
+{{"confidence_score": 0.0, "fields": {{"column_name": "value"}}, "field_confidence": {{"column_name": 0.0}}, "references": {{"column_name": "page or text evidence"}}}}
 Only include the requested fields: {columns}.
-If the file contents are not available in the prompt, set unknown values to "Requires review" and confidence_score to 0.
+Use this extracted document text:
+{text_for_prompt}
+
+If the text is empty or a requested value is not present, set the field to "Requires review" and lower the confidence score.
 """.strip()
     return invoke_bedrock_json(prompt, max_tokens=900)

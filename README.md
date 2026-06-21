@@ -8,7 +8,7 @@ A runnable MVP scaffold for the SaaS data discovery and POC acceleration platfor
 - FastAPI backend in `apps/api`
 - Tenant-scoped source system, scan, profile, document, graph, agent, POC asset, and report APIs
 - SQLAlchemy models for the core PostgreSQL-ready schema
-- Real source registration, structured file upload validation, profiling, AWS Bedrock-backed AI surfaces, rendered architecture, and POC asset generation
+- JWT login, tenant membership validation, RBAC, real source registration, structured file upload validation, scalable profiling, document text extraction, AWS Bedrock-backed AI surfaces, rendered architecture, Neo4j sync hooks, and POC asset generation
 - Docker Compose services for API, web, PostgreSQL, Redis, and Neo4j
 
 ## Quick Start
@@ -36,9 +36,18 @@ Open `http://localhost:3000`.
 
 ## API Notes
 
-The API enforces tenant scoping through the `X-Tenant-Id` header. If no header is supplied, it uses `DEFAULT_TENANT_ID` for local development.
+The API requires login for tenant data. Set a bootstrap admin for local development:
 
-Long-running operations return a job id immediately and record status in the `jobs` table. The local MVP runs these through FastAPI background tasks; the service layer is shaped so Celery or Temporal can replace that executor later.
+```powershell
+$env:DEFAULT_TENANT_ID="11111111-1111-4111-8111-111111111111"
+$env:AUTH_JWT_SECRET="replace_with_a_long_random_secret"
+$env:BOOTSTRAP_ADMIN_EMAIL="admin@example.com"
+$env:BOOTSTRAP_ADMIN_PASSWORD="change_me"
+```
+
+Use `/api/auth/login` to get a bearer token. API calls must include `Authorization: Bearer <token>` and the matching `X-Tenant-Id`. Roles are `viewer`, `analyst`, and `admin`.
+
+Long-running operations return a job id immediately and record status, progress, cancellation state, and logs in the `jobs` and `job_logs` tables. The default backend is FastAPI background tasks; `JOB_BACKEND` is reserved for Celery or Temporal wiring.
 
 ## Assessment Flow
 
@@ -51,7 +60,7 @@ Long-running operations return a job id immediately and record status in the `jo
 
 ## Connect Data Sources
 
-Set the connection string only in the API process environment, then register the source with `env://HUB_SOURCE_URL` in the portal. The app stores the reference, not the credential value.
+Set the connection string only in the API process environment, then register the source with `env://HUB_SOURCE_URL` in the portal. The app stores the reference, not the credential value. Azure Key Vault references are also supported with `kv://vault-name/secret-name`, `vault://vault-name/secret-name`, or `secret://vault-name/secret-name` when Azure credentials are available to the API process.
 
 ```powershell
 $env:HUB_SOURCE_URL="postgresql+psycopg://readonly_user:password@localhost:5432/my_database"
@@ -74,6 +83,32 @@ Structured files can also be uploaded as connected systems. File validation is t
 - `Parquet`: `.parquet`
 
 PDF and image files are not accepted as connected systems.
+
+## Profiling And Metadata
+
+Metadata scans persist tables, columns, indexes, foreign-key relationships, views, and stored procedure placeholders where the connector can discover them. Profiling uses bounded sampling controls:
+
+```powershell
+$env:PROFILE_DEFAULT_ROW_LIMIT="10000"
+$env:PROFILE_DEFAULT_MAX_COLUMNS="50"
+$env:PROFILE_DEFAULT_TIMEOUT_SECONDS="30"
+```
+
+Quality scores are calculated from profiled null percentages, distinct-count ratios, freshness signals, validity issues, and relationship consistency.
+
+## Documents
+
+Document extraction reads uploaded file content before calling Bedrock. Supported local text extraction includes text, markdown, CSV, Excel, DOCX, and text-based PDF files. OCR/Textract/Azure Document Intelligence can be added behind the same extraction metadata contract for scanned documents.
+
+## Knowledge Graph
+
+PostgreSQL remains the source of truth for metadata. If Neo4j settings are present, scans also sync source systems, tables, business entities, and dependency relationships to Neo4j:
+
+```powershell
+$env:NEO4J_URI="bolt://localhost:7687"
+$env:NEO4J_USER="neo4j"
+$env:NEO4J_PASSWORD="hub_password"
+```
 
 ## AWS Bedrock
 

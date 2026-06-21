@@ -1,7 +1,8 @@
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import DataQualityIssue, MetadataTable, SourceSystem
+from app.config import get_settings
+from app.models import DataQualityIssue, MetadataRelationship, MetadataTable, SourceSystem
 
 
 def graph_entities(db: Session, tenant_id: str) -> list[dict]:
@@ -21,10 +22,13 @@ def graph_lineage(db: Session, tenant_id: str, entity_id: str) -> dict:
     tables = db.scalars(select(MetadataTable).where(MetadataTable.tenant_id == tenant_id)).all()
     nodes = graph_entities(db, tenant_id)
     edges = []
+    relationships = db.scalars(select(MetadataRelationship).where(MetadataRelationship.tenant_id == tenant_id)).all()
     for table in tables:
         edges.append({"from": table.source_system_id, "to": table.id, "relationship": "CONTAINS"})
         if table.detected_entity:
             edges.append({"from": table.id, "to": f"entity-{table.detected_entity}", "relationship": "REPRESENTS"})
+    for relationship in relationships:
+        edges.append({"from": relationship.from_table, "to": relationship.to_table, "relationship": relationship.relationship_type})
     return {"entity_id": entity_id, "nodes": nodes, "edges": edges}
 
 
@@ -41,3 +45,66 @@ def graph_issues(db: Session, tenant_id: str) -> list[dict]:
         }
         for issue in issues
     ]
+
+
+def sync_neo4j_graph(db: Session, tenant_id: str) -> None:
+    settings = get_settings()
+    if not settings.neo4j_uri or not settings.neo4j_user or not settings.neo4j_password:
+        return
+    try:
+        from neo4j import GraphDatabase
+    except ImportError:
+        return
+
+    sources = db.scalars(select(SourceSystem).where(SourceSystem.tenant_id == tenant_id)).all()
+    tables = db.scalars(select(MetadataTable).where(MetadataTable.tenant_id == tenant_id)).all()
+    relationships = db.scalars(select(MetadataRelationship).where(MetadataRelationship.tenant_id == tenant_id)).all()
+    driver = GraphDatabase.driver(settings.neo4j_uri, auth=(settings.neo4j_user, settings.neo4j_password))
+    try:
+        with driver.session() as session:
+            session.run("MERGE (tenant:Tenant {id: $tenant_id})", tenant_id=tenant_id)
+            for source in sources:
+                session.run(
+                    """
+                    MATCH (tenant:Tenant {id: $tenant_id})
+                    MERGE (system:SourceSystem {id: $source_id})
+                    SET system.name = $name, system.system_type = $system_type
+                    MERGE (tenant)-[:OWNS]->(system)
+                    """,
+                    tenant_id=tenant_id,
+                    source_id=source.id,
+                    name=source.name,
+                    system_type=source.system_type,
+                )
+            for table in tables:
+                session.run(
+                    """
+                    MATCH (system:SourceSystem {id: $source_id})
+                    MERGE (table:Table {id: $table_id})
+                    SET table.name = $table_name, table.entity = $entity
+                    MERGE (system)-[:CONTAINS]->(table)
+                    WITH table
+                    FOREACH (_ IN CASE WHEN $entity IS NULL THEN [] ELSE [1] END |
+                      MERGE (entity:BusinessEntity {tenant_id: $tenant_id, name: $entity})
+                      MERGE (table)-[:REPRESENTS]->(entity)
+                    )
+                    """,
+                    tenant_id=tenant_id,
+                    source_id=table.source_system_id,
+                    table_id=table.id,
+                    table_name=table.table_name,
+                    entity=table.detected_entity,
+                )
+            for relationship in relationships:
+                session.run(
+                    """
+                    MATCH (from_table:Table {name: $from_table})
+                    MATCH (to_table:Table {name: $to_table})
+                    MERGE (from_table)-[:DEPENDS_ON {type: $relationship_type}]->(to_table)
+                    """,
+                    from_table=relationship.from_table,
+                    to_table=relationship.to_table,
+                    relationship_type=relationship.relationship_type,
+                )
+    finally:
+        driver.close()

@@ -20,6 +20,27 @@ class Tenant(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    email: Mapped[str] = mapped_column(String(320), unique=True, index=True, nullable=False)
+    display_name: Mapped[str | None] = mapped_column(String(180))
+    password_hash: Mapped[str] = mapped_column(String(500), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class TenantMembership(Base):
+    __tablename__ = "tenant_memberships"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    tenant_id: Mapped[str] = mapped_column(String(36), ForeignKey("tenants.id"), index=True, nullable=False)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), index=True, nullable=False)
+    role: Mapped[str] = mapped_column(String(40), default="viewer")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class SourceSystem(Base):
     __tablename__ = "source_systems"
 
@@ -46,6 +67,9 @@ class MetadataTable(Base):
     table_name: Mapped[str] = mapped_column(String(180), nullable=False)
     row_count: Mapped[int] = mapped_column(Integer, default=0)
     detected_entity: Mapped[str | None] = mapped_column(String(120))
+    owner: Mapped[str | None] = mapped_column(String(180))
+    steward: Mapped[str | None] = mapped_column(String(180))
+    source_freshness_at: Mapped[datetime | None] = mapped_column(DateTime)
     discovered_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     columns: Mapped[list["MetadataColumn"]] = relationship(cascade="all, delete-orphan")
@@ -65,6 +89,57 @@ class MetadataColumn(Base):
     null_percentage: Mapped[float | None] = mapped_column(Float)
     distinct_count: Mapped[int | None] = mapped_column(Integer)
     sample_values: Mapped[list[str] | None] = mapped_column(JSON)
+    discovered_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class MetadataIndex(Base):
+    __tablename__ = "metadata_indexes"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    tenant_id: Mapped[str] = mapped_column(String(36), index=True, nullable=False)
+    table_id: Mapped[str] = mapped_column(String(36), ForeignKey("metadata_tables.id"), index=True, nullable=False)
+    index_name: Mapped[str] = mapped_column(String(180), nullable=False)
+    column_names: Mapped[list[str]] = mapped_column(JSON, default=list)
+    is_unique: Mapped[bool] = mapped_column(Boolean, default=False)
+    discovered_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class MetadataRelationship(Base):
+    __tablename__ = "metadata_relationships"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    tenant_id: Mapped[str] = mapped_column(String(36), index=True, nullable=False)
+    source_system_id: Mapped[str] = mapped_column(String(36), ForeignKey("source_systems.id"), index=True, nullable=False)
+    from_table: Mapped[str] = mapped_column(String(180), nullable=False)
+    from_columns: Mapped[list[str]] = mapped_column(JSON, default=list)
+    to_table: Mapped[str] = mapped_column(String(180), nullable=False)
+    to_columns: Mapped[list[str]] = mapped_column(JSON, default=list)
+    relationship_type: Mapped[str] = mapped_column(String(80), default="FOREIGN_KEY")
+    discovered_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class MetadataView(Base):
+    __tablename__ = "metadata_views"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    tenant_id: Mapped[str] = mapped_column(String(36), index=True, nullable=False)
+    source_system_id: Mapped[str] = mapped_column(String(36), ForeignKey("source_systems.id"), index=True, nullable=False)
+    database_name: Mapped[str | None] = mapped_column(String(120))
+    schema_name: Mapped[str | None] = mapped_column(String(120))
+    view_name: Mapped[str] = mapped_column(String(180), nullable=False)
+    definition: Mapped[str | None] = mapped_column(Text)
+    discovered_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class MetadataProcedure(Base):
+    __tablename__ = "metadata_procedures"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    tenant_id: Mapped[str] = mapped_column(String(36), index=True, nullable=False)
+    source_system_id: Mapped[str] = mapped_column(String(36), ForeignKey("source_systems.id"), index=True, nullable=False)
+    schema_name: Mapped[str | None] = mapped_column(String(120))
+    procedure_name: Mapped[str] = mapped_column(String(180), nullable=False)
+    definition: Mapped[str | None] = mapped_column(Text)
     discovered_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
@@ -115,10 +190,13 @@ class Document(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     tenant_id: Mapped[str] = mapped_column(String(36), index=True, nullable=False)
     file_name: Mapped[str] = mapped_column(String(250), nullable=False)
+    file_path: Mapped[str | None] = mapped_column(String(500))
     document_type: Mapped[str] = mapped_column(String(120), nullable=False)
     status: Mapped[str] = mapped_column(String(40), default="uploaded")
     target_schema: Mapped[dict | None] = mapped_column(JSON)
+    extracted_text: Mapped[str | None] = mapped_column(Text)
     extracted_fields: Mapped[dict | None] = mapped_column(JSON)
+    extraction_metadata: Mapped[dict | None] = mapped_column(JSON)
     confidence_score: Mapped[float | None] = mapped_column(Float)
     approved_at: Mapped[datetime | None] = mapped_column(DateTime)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
@@ -133,8 +211,22 @@ class Job(Base):
     status: Mapped[str] = mapped_column(String(40), default="queued")
     message: Mapped[str | None] = mapped_column(Text)
     result: Mapped[dict | None] = mapped_column(JSON)
+    progress_percent: Mapped[int] = mapped_column(Integer, default=0)
+    cancel_requested: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class JobLog(Base):
+    __tablename__ = "job_logs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    tenant_id: Mapped[str] = mapped_column(String(36), index=True, nullable=False)
+    job_id: Mapped[str] = mapped_column(String(36), ForeignKey("jobs.id"), index=True, nullable=False)
+    level: Mapped[str] = mapped_column(String(20), default="info")
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    details: Mapped[dict | None] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
 class AuditLog(Base):

@@ -1,7 +1,9 @@
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session, selectinload
 
+from app.config import get_settings
 from app.connectors import connector_for_source
+from app.connectors.base import ProfileConfig
 from app.models import DataQualityIssue, MetadataTable, SourceSystem
 from app.services.audit import audit
 
@@ -20,6 +22,12 @@ def run_profile(db: Session, tenant_id: str, source_system_id: str) -> dict:
         raise ValueError("Run metadata scan before profiling")
 
     connector = connector_for_source(source)
+    settings = get_settings()
+    config = ProfileConfig(
+        row_limit=settings.profile_default_row_limit,
+        max_columns=settings.profile_default_max_columns,
+        timeout_seconds=settings.profile_default_timeout_seconds,
+    )
     table_ids = [table.id for table in tables]
     db.execute(delete(DataQualityIssue).where(DataQualityIssue.tenant_id == tenant_id, DataQualityIssue.table_id.in_(table_ids)))
 
@@ -30,6 +38,7 @@ def run_profile(db: Session, tenant_id: str, source_system_id: str) -> dict:
             table.table_name,
             [column.column_name for column in table.columns],
             table.row_count,
+            config,
         )
         has_pk = any(column.is_primary_key for column in table.columns)
         has_freshness = any("updated" in column.column_name.lower() or "modified" in column.column_name.lower() for column in table.columns)
@@ -98,16 +107,31 @@ def run_profile(db: Session, tenant_id: str, source_system_id: str) -> dict:
 
 
 def quality_scores(db: Session, tenant_id: str) -> dict[str, int]:
-    issue_count = len(db.scalars(select(DataQualityIssue.id).where(DataQualityIssue.tenant_id == tenant_id)).all())
-    completeness = max(35, 90 - issue_count * 4)
-    uniqueness = max(40, 84 - issue_count * 3)
-    freshness = max(30, 82 - issue_count * 5)
-    consistency = max(40, 80 - issue_count * 3)
-    overall = round((completeness + uniqueness + freshness + consistency) / 4)
+    tables = db.scalars(select(MetadataTable).options(selectinload(MetadataTable.columns)).where(MetadataTable.tenant_id == tenant_id)).all()
+    columns = [column for table in tables for column in table.columns]
+    if not tables or not columns:
+        return {"completeness": 0, "uniqueness": 0, "freshness": 0, "validity": 0, "consistency": 0, "overall": 0}
+
+    completeness = round(100 - (sum(column.null_percentage or 0 for column in columns) / len(columns)))
+    uniqueness_scores = []
+    for table in tables:
+        for column in table.columns:
+            if table.row_count <= 0:
+                continue
+            uniqueness_scores.append(min(100, round(((column.distinct_count or 0) / table.row_count) * 100)))
+    uniqueness = round(sum(uniqueness_scores) / len(uniqueness_scores)) if uniqueness_scores else 0
+    freshness = round(
+        sum(100 if table.source_freshness_at else 70 if any("updated" in column.column_name.lower() or "modified" in column.column_name.lower() for column in table.columns) else 35 for table in tables)
+        / len(tables)
+    )
+    validity = max(0, 100 - len(db.scalars(select(DataQualityIssue.id).where(DataQualityIssue.tenant_id == tenant_id)).all()) * 5)
+    consistency = round(sum(100 if any(column.is_foreign_key for column in table.columns) else 70 for table in tables) / len(tables))
+    overall = round((completeness + uniqueness + freshness + validity + consistency) / 5)
     return {
         "completeness": completeness,
         "uniqueness": uniqueness,
         "freshness": freshness,
+        "validity": validity,
         "consistency": consistency,
         "overall": overall,
     }

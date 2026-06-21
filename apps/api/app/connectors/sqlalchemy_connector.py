@@ -1,10 +1,10 @@
-import os
 from typing import Any
 
 from sqlalchemy import MetaData, Table, create_engine, func, inspect, select
 from sqlalchemy.engine import Engine
 
-from app.connectors.base import BaseConnector, ColumnMetadata, TableMetadata
+from app.connectors.base import BaseConnector, ColumnMetadata, IndexMetadata, ProfileConfig, RelationshipMetadata, TableMetadata, ViewMetadata
+from app.services.secrets import resolve_secret_reference
 
 
 class SqlAlchemyConnector(BaseConnector):
@@ -59,18 +59,76 @@ class SqlAlchemyConnector(BaseConnector):
                 )
         return tables
 
-    def profile_columns(self, schema_name: str, table_name: str, columns: list[str], row_count: int) -> dict[str, dict[str, Any]]:
+    def list_indexes(self) -> list[IndexMetadata]:
+        inspector = inspect(self.engine)
+        indexes: list[IndexMetadata] = []
+        for schema in self.list_schemas():
+            table_schema = None if self.engine.dialect.name == "sqlite" else schema
+            for table_name in inspector.get_table_names(schema=table_schema):
+                for index in inspector.get_indexes(table_name, schema=table_schema):
+                    indexes.append(
+                        IndexMetadata(
+                            table_name=table_name,
+                            index_name=str(index.get("name") or "unnamed_index"),
+                            column_names=list(index.get("column_names") or []),
+                            is_unique=bool(index.get("unique", False)),
+                        )
+                    )
+        return indexes
+
+    def list_relationships(self) -> list[RelationshipMetadata]:
+        inspector = inspect(self.engine)
+        relationships: list[RelationshipMetadata] = []
+        for schema in self.list_schemas():
+            table_schema = None if self.engine.dialect.name == "sqlite" else schema
+            for table_name in inspector.get_table_names(schema=table_schema):
+                for foreign_key in inspector.get_foreign_keys(table_name, schema=table_schema):
+                    referred_table = foreign_key.get("referred_table")
+                    if not referred_table:
+                        continue
+                    relationships.append(
+                        RelationshipMetadata(
+                            from_table=table_name,
+                            from_columns=list(foreign_key.get("constrained_columns") or []),
+                            to_table=str(referred_table),
+                            to_columns=list(foreign_key.get("referred_columns") or []),
+                        )
+                    )
+        return relationships
+
+    def list_views(self) -> list[ViewMetadata]:
+        inspector = inspect(self.engine)
+        views: list[ViewMetadata] = []
+        database_name = self.engine.url.database or self.source_name
+        for schema in self.list_schemas():
+            table_schema = None if self.engine.dialect.name == "sqlite" else schema
+            for view_name in inspector.get_view_names(schema=table_schema):
+                views.append(
+                    ViewMetadata(
+                        database_name=database_name,
+                        schema_name=schema,
+                        view_name=view_name,
+                        definition=inspector.get_view_definition(view_name, schema=table_schema),
+                    )
+                )
+        return views
+
+    def profile_columns(self, schema_name: str, table_name: str, columns: list[str], row_count: int, config: ProfileConfig) -> dict[str, dict[str, Any]]:
         table_schema = None if self.engine.dialect.name == "sqlite" else schema_name
         table = Table(table_name, MetaData(), schema=table_schema, autoload_with=self.engine)
+        selected_columns = [column for column in columns[: config.max_columns] if column in table.c]
+        sample = select(table).limit(config.row_limit).subquery()
         profiles: dict[str, dict[str, Any]] = {}
-        with self.engine.connect() as connection:
-            for column_name in columns:
-                column = table.c[column_name]
-                null_count = connection.execute(select(func.count()).select_from(table).where(column.is_(None))).scalar_one()
-                distinct_count = connection.execute(select(func.count(func.distinct(column))).select_from(table)).scalar_one()
+        with self.engine.connect().execution_options(timeout=config.timeout_seconds) as connection:
+            sampled_count = int(connection.execute(select(func.count()).select_from(sample)).scalar_one() or 0)
+            for column_name in selected_columns:
+                column = sample.c[column_name]
+                null_count = connection.execute(select(func.count()).select_from(sample).where(column.is_(None))).scalar_one()
+                distinct_count = connection.execute(select(func.count(func.distinct(column))).select_from(sample)).scalar_one()
                 profiles[column_name] = {
-                    "null_percentage": round((null_count / row_count) * 100, 2) if row_count else 0,
+                    "null_percentage": round((null_count / sampled_count) * 100, 2) if sampled_count else 0,
                     "distinct_count": int(distinct_count or 0),
+                    "sampled_row_count": sampled_count,
                 }
         return profiles
 
@@ -81,16 +139,4 @@ class SqlAlchemyConnector(BaseConnector):
 
 
 def resolve_connection_url(secret_reference: str | None) -> str:
-    if not secret_reference:
-        raise ValueError("A SQL source requires a secret reference such as env://HUB_SOURCE_URL")
-    if secret_reference.startswith("env://"):
-        variable_name = secret_reference.removeprefix("env://")
-        connection_url = os.getenv(variable_name)
-        if not connection_url:
-            raise ValueError(f"Environment variable {variable_name} is not set")
-        return connection_url
-    if secret_reference.startswith("sqlite://"):
-        return secret_reference
-    if secret_reference.startswith(("kv://", "vault://", "secret://")):
-        raise ValueError("Vault secret resolution is not configured in this runtime. Use env:// for environment-provided credentials.")
-    raise ValueError("Use env://VARIABLE_NAME for credentials or sqlite:///path/to/file.db for SQLite sources")
+    return resolve_secret_reference(secret_reference)
