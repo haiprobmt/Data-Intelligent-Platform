@@ -99,3 +99,6 @@ class BaseConnector(ABC):
 
     def profile_columns(self, schema_name: str, table_name: str, columns: list[str], row_count: int, config: ProfileConfig) -> dict[str, dict[str, Any]]:
         return {}
+
+    def find_duplicate_rows(self, schema_name: str, table_name: str, columns: list[str], config: ProfileConfig) -> dict[str, Any]:
+        return {}

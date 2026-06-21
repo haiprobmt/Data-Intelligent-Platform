@@ -54,14 +54,16 @@ def sync_neo4j_graph(db: Session, tenant_id: str) -> None:
         return
     try:
         from neo4j import GraphDatabase
+        from neo4j.exceptions import Neo4jError, ServiceUnavailable
     except ImportError:
         return
 
-    sources = db.scalars(select(SourceSystem).where(SourceSystem.tenant_id == tenant_id)).all()
-    tables = db.scalars(select(MetadataTable).where(MetadataTable.tenant_id == tenant_id)).all()
-    relationships = db.scalars(select(MetadataRelationship).where(MetadataRelationship.tenant_id == tenant_id)).all()
-    driver = GraphDatabase.driver(settings.neo4j_uri, auth=(settings.neo4j_user, settings.neo4j_password))
+    driver = None
     try:
+        sources = db.scalars(select(SourceSystem).where(SourceSystem.tenant_id == tenant_id)).all()
+        tables = db.scalars(select(MetadataTable).where(MetadataTable.tenant_id == tenant_id)).all()
+        relationships = db.scalars(select(MetadataRelationship).where(MetadataRelationship.tenant_id == tenant_id)).all()
+        driver = GraphDatabase.driver(settings.neo4j_uri, auth=(settings.neo4j_user, settings.neo4j_password))
         with driver.session() as session:
             session.run("MERGE (tenant:Tenant {id: $tenant_id})", tenant_id=tenant_id)
             for source in sources:
@@ -115,5 +117,8 @@ def sync_neo4j_graph(db: Session, tenant_id: str) -> None:
                     to_table_id=relationship.to_table_id,
                     relationship_type=relationship.relationship_type,
                 )
+    except (Neo4jError, ServiceUnavailable, OSError):
+        return
     finally:
-        driver.close()
+        if driver is not None:
+            driver.close()

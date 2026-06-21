@@ -8,6 +8,7 @@ from fastapi.responses import Response
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
+from app.connectors import connector_for_source
 from app.config import get_settings, validate_security_settings
 from app.database import Base, SessionLocal, engine, get_db
 from app.models import AssessmentProfile, AssessmentProject, ConnectionSecret, DataQualityIssue, Document, DocumentExtractedField, Job, JobLog, MetadataColumn, MetadataTable, PocAsset, Recommendation, SourceSystem, Tenant, TenantMembership, User
@@ -49,7 +50,7 @@ from app.services.profiler import quality_scores, run_profile
 from app.services.recommendations import architecture_mermaid, generate_poc_assets, generate_recommendations
 from app.services.scanner import run_metadata_scan
 from app.services.schema_compat import ensure_schema_compat
-from app.services.secrets import provider_for_reference, resolve_secret_reference, validate_secret_reference_for_tenant
+from app.services.secrets import provider_for_reference, resolve_secret_reference, source_secret_reference, validate_secret_reference_for_tenant
 from app.services.uploads import save_uploaded_file, validate_source_file
 
 settings = get_settings()
@@ -268,6 +269,27 @@ def get_source_system(source_system_id: str, context: AuthContext = Depends(get_
     if source is None or source.tenant_id != tenant_id:
         raise HTTPException(status_code=404, detail="Source system not found")
     return source
+
+
+@app.post("/api/source-systems/{source_system_id}/test-connection")
+def test_source_system_connection(source_system_id: str, context: AuthContext = Depends(require_role("analyst")), db: Session = Depends(get_db)) -> dict[str, str]:
+    tenant_id = context.tenant_id
+    source = db.get(SourceSystem, source_system_id)
+    if source is None or source.tenant_id != tenant_id:
+        raise HTTPException(status_code=404, detail="Source system not found")
+    try:
+        connector = connector_for_source(source, source_secret_reference(db, tenant_id, source))
+        connected = connector.test_connection()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Connection test failed: {exc}") from exc
+    if not connected:
+        raise HTTPException(status_code=400, detail="Connection test failed")
+    source.status = "connected"
+    audit(db, tenant_id, "source.test_connection", {"source_system_id": source.id, "system_type": source.system_type})
+    db.commit()
+    return {"status": "connected", "source_system_id": source.id}
 
 
 @app.delete("/api/source-systems/{source_system_id}")

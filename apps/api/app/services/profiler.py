@@ -101,6 +101,28 @@ def run_profile(db: Session, tenant_id: str, source_system_id: str, job_id: str 
             )
             issues_created += 1
 
+        duplicate_profile = connector.find_duplicate_rows(
+            table.schema_name or "main",
+            table.table_name,
+            [column.column_name for column in table.columns],
+            config,
+        )
+        duplicate_rows = int(duplicate_profile.get("duplicate_rows") or 0)
+        if duplicate_rows > 0:
+            sampled_row_count = int(duplicate_profile.get("sampled_row_count") or table.row_count or 0)
+            duplicate_rate = round((duplicate_rows / sampled_row_count) * 100, 2) if sampled_row_count else 0
+            db.add(
+                DataQualityIssue(
+                    tenant_id=tenant_id,
+                    table_id=table.id,
+                    issue_type="Duplicate rows detected",
+                    severity="High" if not has_pk else "Medium",
+                    description=f"{table.table_name} has {duplicate_rows} duplicate sampled row(s) ({duplicate_rate:.1f}% of sampled rows).",
+                    recommendation="Define uniqueness rules and deduplicate records before trusted reporting, reconciliation, or AI use cases.",
+                )
+            )
+            issues_created += 1
+
         for column in table.columns:
             column_profile = real_profiles.get(column.column_name, {})
             column.null_percentage = column_profile.get("null_percentage", 0)

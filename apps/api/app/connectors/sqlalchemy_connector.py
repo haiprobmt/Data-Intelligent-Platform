@@ -136,6 +136,26 @@ class SqlAlchemyConnector(BaseConnector):
                 }
         return profiles
 
+    def find_duplicate_rows(self, schema_name: str, table_name: str, columns: list[str], config: ProfileConfig) -> dict[str, Any]:
+        table_schema = None if self.engine.dialect.name == "sqlite" else schema_name
+        table = Table(table_name, MetaData(), schema=table_schema, autoload_with=self.engine)
+        selected_columns = [column for column in columns[: config.max_columns] if column in table.c]
+        if not selected_columns:
+            return {"duplicate_rows": 0, "sampled_row_count": 0, "columns_checked": []}
+        sample = select(*(table.c[column] for column in selected_columns)).limit(config.row_limit).subquery()
+        group_columns = [sample.c[column] for column in selected_columns]
+        grouped = select(func.count().label("row_count")).select_from(sample).group_by(*group_columns).having(func.count() > 1).subquery()
+        with self.engine.connect().execution_options(timeout=config.timeout_seconds) as connection:
+            self._apply_statement_timeout(connection, config.timeout_seconds)
+            sampled_count = int(connection.execute(select(func.count()).select_from(sample)).scalar_one() or 0)
+            duplicate_groups = [int(value or 0) for value in connection.execute(select(grouped.c.row_count)).scalars().all()]
+        return {
+            "duplicate_rows": sum(count - 1 for count in duplicate_groups),
+            "duplicate_groups": len(duplicate_groups),
+            "sampled_row_count": sampled_count,
+            "columns_checked": selected_columns,
+        }
+
     def _apply_statement_timeout(self, connection, timeout_seconds: int) -> None:
         timeout_ms = max(1, timeout_seconds) * 1000
         dialect = self.engine.dialect.name

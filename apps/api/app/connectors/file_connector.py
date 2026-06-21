@@ -46,6 +46,17 @@ class FileConnector(BaseConnector):
             }
         return profiles
 
+    def find_duplicate_rows(self, schema_name: str, table_name: str, columns: list[str], config: ProfileConfig) -> dict[str, Any]:
+        rows, _columns = self._read_rows()
+        rows = rows[: config.row_limit]
+        selected_columns = columns[: config.max_columns]
+        duplicate_rows = _count_duplicate_rows(rows, selected_columns)
+        return {
+            "duplicate_rows": duplicate_rows,
+            "sampled_row_count": len(rows),
+            "columns_checked": selected_columns,
+        }
+
     def _read_rows(self) -> tuple[list[dict[str, Any]], list[str]]:
         if self.system_type == "csv":
             return _read_csv(self.file_path)
@@ -105,6 +116,28 @@ def _read_parquet(file_path: Path) -> tuple[list[dict[str, Any]], list[str]]:
     table = pq.read_table(file_path)
     rows = table.to_pylist()
     return rows, list(table.column_names)
+
+
+def _count_duplicate_rows(rows: list[dict[str, Any]], columns: list[str]) -> int:
+    if not rows or not columns:
+        return 0
+    seen: dict[tuple[str, ...], int] = {}
+    duplicate_rows = 0
+    for row in rows:
+        signature = tuple(_normalized_cell(row.get(column)) for column in columns)
+        if all(value == "" for value in signature):
+            continue
+        previous_count = seen.get(signature, 0)
+        if previous_count:
+            duplicate_rows += 1
+        seen[signature] = previous_count + 1
+    return duplicate_rows
+
+
+def _normalized_cell(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip().casefold()
 
 
 def _infer_type(values: list[Any]) -> str:
